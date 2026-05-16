@@ -1,0 +1,1 @@
+# Degiro_trading_bot

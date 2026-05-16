@@ -11,8 +11,25 @@ CHAT_ID = os.environ.get("CHAT_ID")
 def home():
     return "Bot werkt!"
 
+@app.route("/send")
+def send_test():
+
+    message = "🚀 TEST BERICHT VAN RENDER BOT"
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message
+    }
+
+    requests.post(url, data=payload)
+
+    return "test gestuurd"
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
+
     data = request.json
 
     message = f"""

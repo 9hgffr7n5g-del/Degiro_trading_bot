@@ -16,27 +16,19 @@ KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY")
 KRAKEN_API_SECRET = os.environ.get("KRAKEN_API_SECRET")
 
 KRAKEN_URL = "https://api.kraken.com"
+PAIR = "XBTEUR"
+BTC_VOLUME = "0.0001"
+
+in_position = False
 
 
-@app.route("/")
-def home():
-    return "Bot + Kraken werkt!"
-
-
-@app.route("/send")
-def send_test():
-    message = "🚀 TEST BERICHT VAN RENDER BOT"
-
+def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     payload = {
         "chat_id": CHAT_ID,
         "text": message
     }
-
     requests.post(url, data=payload)
-
-    return "test gestuurd"
 
 
 def kraken_signature(urlpath, data, secret):
@@ -44,22 +36,14 @@ def kraken_signature(urlpath, data, secret):
     encoded = (str(data["nonce"]) + postdata).encode()
     message = urlpath.encode() + hashlib.sha256(encoded).digest()
     mac = hmac.new(base64.b64decode(secret), message, hashlib.sha512)
-    sigdigest = base64.b64encode(mac.digest())
-
-    return sigdigest.decode()
+    return base64.b64encode(mac.digest()).decode()
 
 
-def kraken_buy_market():
+def kraken_private_request(endpoint, data):
     nonce = str(int(time.time() * 1000))
-    urlpath = "/0/private/AddOrder"
+    urlpath = f"/0/private/{endpoint}"
 
-    data = {
-        "nonce": nonce,
-        "ordertype": "market",
-        "type": "buy",
-        "volume": "0.0001",
-        "pair": "XBTEUR"
-    }
+    data["nonce"] = nonce
 
     headers = {
         "API-Key": KRAKEN_API_KEY,
@@ -72,41 +56,111 @@ def kraken_buy_market():
         data=data
     )
 
-    return response.text
+    return response.json()
+
+
+def kraken_buy():
+    data = {
+        "ordertype": "market",
+        "type": "buy",
+        "volume": BTC_VOLUME,
+        "pair": PAIR
+    }
+
+    return kraken_private_request("AddOrder", data)
+
+
+def kraken_sell():
+    data = {
+        "ordertype": "market",
+        "type": "sell",
+        "volume": BTC_VOLUME,
+        "pair": PAIR
+    }
+
+    return kraken_private_request("AddOrder", data)
+
+
+@app.route("/")
+def home():
+    return "Bot + Kraken werkt!"
+
+
+@app.route("/send")
+def send_test():
+    send_telegram("🚀 TEST BERICHT VAN RENDER BOT")
+    return "test gestuurd"
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    global in_position
+
     data = request.json or {}
 
     action = data.get("action")
+    ticker = data.get("ticker")
+    price = data.get("price")
+    timeframe = data.get("timeframe")
 
     message = f"""
 🚀 Trading Alert
 
-Ticker: {data.get('ticker')}
+Ticker: {ticker}
 Actie: {action}
-Prijs: {data.get('price')}
-Timeframe: {data.get('timeframe')}
+Prijs: {price}
+Timeframe: {timeframe}
 """
 
     if action == "BUY LONG":
-        kraken_result = kraken_buy_market()
 
-        message += f"""
+        if in_position:
+            message += """
 
-✅ Kraken BUY verstuurd
-{kraken_result}
+⚠️ BUY genegeerd
+Er staat al een BTC-positie open.
+Geen extra koop uitgevoerd.
+"""
+        else:
+            result = kraken_buy()
+            in_position = True
+
+            message += f"""
+
+✅ Kraken BUY uitgevoerd
+Volume: {BTC_VOLUME} BTC
+Resultaat: {result}
 """
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    elif action == "SELL / EXIT LONG":
 
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message
-    }
+        if not in_position:
+            message += """
 
-    requests.post(url, data=payload)
+⚠️ EXIT genegeerd
+Geen open BTC-positie volgens bot.
+Geen verkoop uitgevoerd.
+"""
+        else:
+            result = kraken_sell()
+            in_position = False
+
+            message += f"""
+
+✅ Kraken SELL uitgevoerd
+Volume: {BTC_VOLUME} BTC
+Resultaat: {result}
+"""
+
+    elif action == "FOMO BLOCK / NO BUY":
+
+        message += """
+
+⛔ FOMO BLOCK
+Geen koop uitgevoerd.
+"""
+
+    send_telegram(message)
 
     return "ok", 200
 

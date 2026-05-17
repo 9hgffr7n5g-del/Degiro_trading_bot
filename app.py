@@ -25,7 +25,6 @@ def home():
 
 @app.route("/send")
 def send_test():
-
     message = "🚀 TEST BERICHT VAN RENDER BOT"
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -41,24 +40,17 @@ def send_test():
 
 
 def kraken_signature(urlpath, data, secret):
-
     postdata = urllib.parse.urlencode(data)
-
     encoded = (str(data["nonce"]) + postdata).encode()
-
     message = urlpath.encode() + hashlib.sha256(encoded).digest()
-
     mac = hmac.new(base64.b64decode(secret), message, hashlib.sha512)
-
     sigdigest = base64.b64encode(mac.digest())
 
     return sigdigest.decode()
 
 
 def kraken_buy_market():
-
     nonce = str(int(time.time() * 1000))
-
     urlpath = "/0/private/AddOrder"
 
     data = {
@@ -85,8 +77,7 @@ def kraken_buy_market():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-
-    data = request.json
+    data = request.json or {}
 
     action = data.get("action")
 
@@ -100,10 +91,13 @@ Timeframe: {data.get('timeframe')}
 """
 
     if action == "BUY LONG":
-
         kraken_result = kraken_buy_market()
 
-        message += f"\n\n✅ Kraken BUY verstuurd\n{kraken_result}"
+        message += f"""
+
+✅ Kraken BUY verstuurd
+{kraken_result}
+"""
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 

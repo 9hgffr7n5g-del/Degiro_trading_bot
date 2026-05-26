@@ -100,7 +100,7 @@ def build_trade_result_text(data, action, price):
         if reason != "":
             lines.append(f"REASON: {reason}")
         if lines:
-            return "\n\nð Trade resultaat\n" + "\n".join(lines)
+            return "\n\nTrade resultaat\n" + "\n".join(lines)
     return ""
 
 
@@ -179,7 +179,7 @@ def home():
 
 @app.route("/send")
 def send_test():
-    send_telegram("ð TEST BERICHT VAN RENDER BOT")
+    send_telegram("TEST BERICHT VAN RENDER BOT")
     return "test gestuurd"
 
 
@@ -211,7 +211,7 @@ def webhook():
     is_old_v5_bot = bot == "V5 BTC SPOT" and ticker == "BTCEUR"
 
     message = f"""
-ð Trading Alert
+Trading Alert
 
 Bot: {bot}
 Ticker: {ticker}
@@ -238,7 +238,7 @@ Order volume: {order_volume}
             result = kraken_buy(order_volume)
             message += f"""
 
-â Kraken BUY uitgevoerd
+OK - Kraken BUY uitgevoerd
 
 Volume:
 {order_volume}
@@ -254,14 +254,14 @@ Resultaat:
             if sell_volume < 0.00001:
                 message += """
 
-â ï¸ EXIT genegeerd
+LET OP - EXIT genegeerd
 Geen BTC positie gevonden.
 """
             else:
                 result = kraken_sell(f"{sell_volume:.8f}")
                 message += f"""
 
-â Kraken SELL uitgevoerd
+OK - Kraken SELL uitgevoerd
 
 Verkocht volume:
 {sell_volume:.8f}
@@ -281,7 +281,7 @@ BTC saldo: {btc_balance}
             if btc_balance > 0.00009:
                 message += """
 
-â ï¸ BUY genegeerd
+LET OP - BUY genegeerd
 Er staat al BTC open.
 Geen extra koop uitgevoerd.
 """
@@ -289,7 +289,7 @@ Geen extra koop uitgevoerd.
                 result = kraken_buy(DEFAULT_BTC_VOLUME)
                 message += f"""
 
-â Kraken BUY uitgevoerd
+OK - Kraken BUY uitgevoerd
 
 Resultaat:
 {result}
@@ -299,14 +299,14 @@ Resultaat:
             if btc_balance < 0.00009:
                 message += """
 
-â ï¸ EXIT genegeerd
+LET OP - EXIT genegeerd
 Geen BTC positie gevonden.
 """
             else:
                 result = kraken_sell(btc_balance)
                 message += f"""
 
-â Kraken SELL uitgevoerd
+OK - Kraken SELL uitgevoerd
 
 Verkocht volume:
 {btc_balance}
@@ -318,14 +318,14 @@ Resultaat:
         elif action == "FOMO BLOCK / NO BUY":
             message += """
 
-â FOMO BLOCK
+FOMO BLOCK
 Geen koop uitgevoerd.
 """
 
     else:
         message += """
 
-â¹ï¸ Alleen Telegram-alert.
+INFO - Alleen Telegram-alert.
 Geen Kraken-order uitgevoerd.
 """
 

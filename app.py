@@ -13,6 +13,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY")
 KRAKEN_API_SECRET = os.environ.get("KRAKEN_API_SECRET")
+
 KRAKEN_URL = "https://api.kraken.com"
 PAIR = "XBTEUR"
 DEFAULT_BTC_VOLUME = "0.0001"
@@ -73,14 +74,14 @@ def build_trade_result_text(data, action, price):
     if trade_points == "" and trade_buy != "" and trade_sell != "":
         try:
             trade_points = str(float(trade_sell) - float(trade_buy))
-        except:
+        except Exception:
             trade_points = ""
 
     if trade_result == "" and trade_points != "":
         try:
             p = float(trade_points)
             trade_result = "WIN" if p > 0 else "LOSS" if p < 0 else "FLAT"
-        except:
+        except Exception:
             trade_result = ""
 
     if action in ["BTC_BUY", "BUY", "BUY LONG", "RECLAIM BUY"]:
@@ -115,10 +116,12 @@ def kraken_private_request(endpoint, data):
     nonce = str(int(time.time() * 1000))
     urlpath = f"/0/private/{endpoint}"
     data["nonce"] = nonce
+
     headers = {
         "API-Key": KRAKEN_API_KEY,
         "API-Sign": kraken_signature(urlpath, data, KRAKEN_API_SECRET)
     }
+
     response = requests.post(KRAKEN_URL + urlpath, headers=headers, data=data)
     return response.json()
 
@@ -127,7 +130,7 @@ def get_btc_balance():
     result = kraken_private_request("Balance", {})
     try:
         return float(result["result"].get("XXBT", 0))
-    except:
+    except Exception:
         return 0
 
 
@@ -141,12 +144,13 @@ def get_json_volume(data, fallback=DEFAULT_BTC_VOLUME):
         or clean_value(data.get("quantity"))
         or fallback
     )
+
     try:
         volume_float = float(volume)
         if volume_float <= 0:
             return fallback
         return f"{volume_float:.8f}"
-    except:
+    except Exception:
         return fallback
 
 
@@ -182,6 +186,7 @@ def send_test():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json or {}
+
     bot = data.get("bot", "")
     action = data.get("action", "")
     ticker = data.get("ticker", "")
@@ -219,52 +224,110 @@ Timeframe: {timeframe}
     if is_rene_btc_bot and live_requested:
         btc_balance = get_btc_balance()
         order_volume = get_json_volume(data)
-        message += f"\n\nBTC saldo: {btc_balance}\nOrder volume: {order_volume}\n"
 
+        message += f"""
+
+BTC saldo: {btc_balance}
+Order volume: {order_volume}
+"""
+
+        # V9.12.1:
+        # BUY wordt NIET meer geblokkeerd door bestaand BTC-saldo.
+        # Jij mag zelf BTC/EUR op Kraken hebben; de bot handelt zijn vaste order_volume.
         if action == "BTC_BUY":
-            max_position_btc = clean_value(data.get("max_position_btc"))
-            try:
-                max_position = float(max_position_btc) if max_position_btc != "" else float(order_volume)
-            except:
-                max_position = float(order_volume)
+            result = kraken_buy(order_volume)
+            message += f"""
 
-            if btc_balance >= max_position * 0.90:
-                message += "\nâ ï¸ BUY genegeerd\nEr staat al BTC open volgens max_position_btc.\nGeen extra koop uitgevoerd.\n"
-            else:
-                result = kraken_buy(order_volume)
-                message += f"\nâ Kraken BUY uitgevoerd\n\nVolume:\n{order_volume}\n\nResultaat:\n{result}\n"
+â Kraken BUY uitgevoerd
 
+Volume:
+{order_volume}
+
+Resultaat:
+{result}
+"""
+
+        # SELL verkoopt maximaal order_volume, nooit je hele BTC-saldo.
         elif action == "BTC_EXIT":
             sell_volume = min(btc_balance, float(order_volume))
+
             if sell_volume < 0.00001:
-                message += "\nâ ï¸ EXIT genegeerd\nGeen BTC positie gevonden.\n"
+                message += """
+
+â ï¸ EXIT genegeerd
+Geen BTC positie gevonden.
+"""
             else:
                 result = kraken_sell(f"{sell_volume:.8f}")
-                message += f"\nâ Kraken SELL uitgevoerd\n\nVerkocht volume:\n{sell_volume:.8f}\n\nResultaat:\n{result}\n"
+                message += f"""
+
+â Kraken SELL uitgevoerd
+
+Verkocht volume:
+{sell_volume:.8f}
+
+Resultaat:
+{result}
+"""
 
     elif is_old_v5_bot:
         btc_balance = get_btc_balance()
-        message += f"\n\nBTC saldo: {btc_balance}\n"
+        message += f"""
+
+BTC saldo: {btc_balance}
+"""
 
         if action in ["BUY LONG", "RECLAIM BUY"]:
             if btc_balance > 0.00009:
-                message += "\nâ ï¸ BUY genegeerd\nEr staat al BTC open.\nGeen extra koop uitgevoerd.\n"
+                message += """
+
+â ï¸ BUY genegeerd
+Er staat al BTC open.
+Geen extra koop uitgevoerd.
+"""
             else:
                 result = kraken_buy(DEFAULT_BTC_VOLUME)
-                message += f"\nâ Kraken BUY uitgevoerd\n\nResultaat:\n{result}\n"
+                message += f"""
+
+â Kraken BUY uitgevoerd
+
+Resultaat:
+{result}
+"""
 
         elif action == "SELL / EXIT LONG":
             if btc_balance < 0.00009:
-                message += "\nâ ï¸ EXIT genegeerd\nGeen BTC positie gevonden.\n"
+                message += """
+
+â ï¸ EXIT genegeerd
+Geen BTC positie gevonden.
+"""
             else:
                 result = kraken_sell(btc_balance)
-                message += f"\nâ Kraken SELL uitgevoerd\n\nVerkocht volume:\n{btc_balance}\n\nResultaat:\n{result}\n"
+                message += f"""
+
+â Kraken SELL uitgevoerd
+
+Verkocht volume:
+{btc_balance}
+
+Resultaat:
+{result}
+"""
 
         elif action == "FOMO BLOCK / NO BUY":
-            message += "\nâ FOMO BLOCK\nGeen koop uitgevoerd.\n"
+            message += """
+
+â FOMO BLOCK
+Geen koop uitgevoerd.
+"""
 
     else:
-        message += "\n\nâ¹ï¸ Alleen Telegram-alert.\nGeen Kraken-order uitgevoerd.\n"
+        message += """
+
+â¹ï¸ Alleen Telegram-alert.
+Geen Kraken-order uitgevoerd.
+"""
 
     send_telegram(message)
     return "ok", 200

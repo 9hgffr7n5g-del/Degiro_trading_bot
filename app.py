@@ -33,6 +33,133 @@ def send_telegram(message):
     requests.post(url, data=payload)
 
 
+def clean_value(value):
+    if value is None:
+        return ""
+    value_str = str(value)
+    if value_str.lower() in ["", "none", "null", "nan"]:
+        return ""
+    return value_str
+
+
+def fmt_number(value, decimals=1):
+    value = clean_value(value)
+    if value == "":
+        return ""
+
+    try:
+        return f"{float(value):.{decimals}f}"
+    except:
+        return str(value)
+
+
+def fmt_points(value):
+    value = clean_value(value)
+    if value == "":
+        return ""
+
+    try:
+        number = float(value)
+        sign = "+" if number > 0 else ""
+        return f"{sign}{number:.1f}"
+    except:
+        return str(value)
+
+
+def build_trade_result_text(data, action, price):
+    """
+    Leest extra Pine/V9.11 velden uit voor Telegram.
+    Laat alleen korte info zien:
+    BUY, SELL, TRADE punten, RESULT en REASON.
+    """
+
+    reason = clean_value(data.get("exit_reason")) or clean_value(data.get("reason"))
+
+    trade_buy = (
+        clean_value(data.get("trade_buy"))
+        or clean_value(data.get("trade_entry_price"))
+        or clean_value(data.get("entry_price"))
+    )
+
+    trade_sell = (
+        clean_value(data.get("trade_sell"))
+        or clean_value(data.get("trade_exit_price"))
+        or clean_value(data.get("exit_price"))
+    )
+
+    trade_points = (
+        clean_value(data.get("trade_points"))
+        or clean_value(data.get("trade_gross_points"))
+        or clean_value(data.get("trade_net_points"))
+    )
+
+    trade_result = (
+        clean_value(data.get("trade_result_simple"))
+        or clean_value(data.get("trade_result"))
+    )
+
+    # Als Pine geen trade_sell meestuurt, gebruik huidige exit-prijs.
+    if trade_sell == "" and action in ["BTC_EXIT", "BTC_SELL", "SELL", "SELL / EXIT LONG"]:
+        trade_sell = clean_value(price)
+
+    # Als punten ontbreken maar BUY en SELL bestaan, zelf berekenen.
+    if trade_points == "" and trade_buy != "" and trade_sell != "":
+        try:
+            trade_points = str(float(trade_sell) - float(trade_buy))
+        except:
+            trade_points = ""
+
+    # Als result ontbreekt, bepalen op basis van punten.
+    if trade_result == "" and trade_points != "":
+        try:
+            points_float = float(trade_points)
+            if points_float > 0:
+                trade_result = "WIN"
+            elif points_float < 0:
+                trade_result = "LOSS"
+            else:
+                trade_result = "FLAT"
+        except:
+            trade_result = ""
+
+    # Bij BUY alleen eventueel reason tonen, geen trade-resultaat.
+    if action in ["BTC_BUY", "BUY", "BUY LONG", "RECLAIM BUY"]:
+        if reason != "":
+            return f"""
+
+Reden: {reason}
+"""
+        return ""
+
+    # Bij EXIT/SELL trade-resultaat tonen.
+    if action in ["BTC_EXIT", "BTC_SELL", "SELL", "SELL / EXIT LONG"]:
+
+        lines = []
+
+        if trade_buy != "":
+            lines.append(f"BUY: {fmt_number(trade_buy, 1)}")
+
+        if trade_sell != "":
+            lines.append(f"SELL: {fmt_number(trade_sell, 1)}")
+
+        if trade_points != "":
+            lines.append(f"TRADE: {fmt_points(trade_points)} punten")
+
+        if trade_result != "":
+            lines.append(f"RESULT: {trade_result}")
+
+        if reason != "":
+            lines.append(f"REASON: {reason}")
+
+        if len(lines) > 0:
+            return """
+
+📊 Trade resultaat
+""" + "\n".join(lines)
+
+    return ""
+
+
 def kraken_signature(urlpath, data, secret):
 
     postdata = urllib.parse.urlencode(data)
@@ -147,6 +274,9 @@ Actie: {action}
 Prijs: {price}
 Timeframe: {timeframe}
 """
+
+    # Extra korte trade-info voor V9.11 / Pine JSON.
+    message += build_trade_result_text(data, action, price)
 
     if is_btc_bot:
 

@@ -293,7 +293,7 @@ def blocked_message(data, reason):
     s = load_state()
     return base_message(data) + trade_text(data, clean(data.get("action")), clean(data.get("price"))) + f"""
 
-â ï¸ Kraken-order NIET uitgevoerd
+LET OP - Kraken-order NIET uitgevoerd
 
 Reden:
 {reason}
@@ -391,7 +391,7 @@ def status():
 @app.route("/reset_state", methods=["GET", "POST"])
 def reset_state_route():
     s = reset_state()
-    send_telegram("â ï¸ Bot-state handmatig gereset. Server denkt nu: geen botpositie open.")
+    send_telegram("LET OP - Bot-state handmatig gereset. Server denkt nu: geen botpositie open.")
     return jsonify({"status": "reset", "state": s})
 
 
@@ -441,7 +441,7 @@ def webhook():
         if order_ok(res):
             oid = order_id(res)
             update_buy_state(volume_float, price, oid)
-            msg = f"""â Kraken BUY uitgevoerd
+            msg = f"""OK - Kraken BUY uitgevoerd
 
 Bot: {bot}
 Ticker: {ticker}
@@ -453,7 +453,7 @@ Reden: {clean(data.get("reason"))}
         else:
             msg = base_message(data) + trade_text(data, action, price) + f"""
 
-â ï¸ Kraken BUY NIET uitgevoerd
+LET OP - Kraken BUY NIET uitgevoerd
 
 Volume:
 {volume}
@@ -466,7 +466,7 @@ Kraken result:
 
     if action == "BTC_EXIT":
         if bot_pos < MIN_BTC_VOLUME:
-            send_telegram(blocked_message(data, "SELL geblokkeerd: server heeft geen bot-owned BTC positie geregistreerd. Dit voorkomt verkoop van privÃ©/eigen BTC."))
+            send_telegram(blocked_message(data, "SELL geblokkeerd: server heeft geen bot-owned BTC positie geregistreerd. Dit voorkomt verkoop van prive/eigen BTC."))
             return "ok", 200
 
         btc_balance = get_btc_balance()
@@ -480,7 +480,7 @@ Kraken result:
         if order_ok(res):
             oid = order_id(res)
             update_sell_state(sell_volume, price, oid)
-            msg = f"""â Kraken SELL uitgevoerd
+            msg = f"""OK - Kraken SELL uitgevoerd
 
 Bot: {bot}
 Ticker: {ticker}
@@ -492,7 +492,7 @@ Order ID: {oid}
         else:
             msg = base_message(data) + trade_text(data, action, price) + f"""
 
-â ï¸ Kraken SELL NIET uitgevoerd
+LET OP - Kraken SELL NIET uitgevoerd
 
 Volume:
 {sell_volume:.8f}

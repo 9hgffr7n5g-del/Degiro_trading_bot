@@ -1,5 +1,11 @@
 from flask import Flask, request, jsonify
-import os, time, json, hmac, base64, hashlib, urllib.parse
+import os
+import time
+import json
+import hmac
+import base64
+import hashlib
+import urllib.parse
 import requests
 from threading import Lock
 
@@ -31,13 +37,27 @@ STATE_LOCK = Lock()
 DEFAULT_STATE = {
     "bot_position_btc": 0.0,
     "last_buy_price": None,
+    "avg_entry_price": None,
+    "last_buy_volume": 0.0,
     "last_buy_order_id": None,
+    "last_buy_ts": None,
     "last_sell_price": None,
+    "last_sell_volume": 0.0,
     "last_sell_order_id": None,
+    "last_sell_ts": None,
     "last_action": None,
     "last_update_ts": None,
     "closed_trades": 0,
     "open_trade_id": None,
+    "last_trade_points": None,
+    "last_trade_gross_eur": None,
+    "last_trade_result": None,
+    "last_trade_entry_price": None,
+    "last_trade_exit_price": None,
+    "last_trade_volume": None,
+    "last_pine_entry_price": None,
+    "last_pine_entry_diff": None,
+    "last_pine_result_warning": "",
     "server_started_ts": int(time.time())
 }
 
@@ -59,7 +79,10 @@ def bval(value):
 
 def fval(value, default=0.0):
     try:
-        return float(clean(value))
+        s = clean(value)
+        if s == "":
+            return default
+        return float(s)
     except Exception:
         return default
 
@@ -78,6 +101,15 @@ def pts(value):
         return f"{sign}{x:.1f}"
     except Exception:
         return str(value)
+
+
+def result_from_points(points_value):
+    p = fval(points_value, 0.0)
+    if p > 0:
+        return "WIN"
+    if p < 0:
+        return "LOSS"
+    return "FLAT"
 
 
 def send_telegram(message):
@@ -247,7 +279,8 @@ def get_volume(data, action):
     return DEFAULT_BTC_VOLUME
 
 
-def trade_text(data, action, price):
+def pine_trade_text(data, action, price):
+    """Alleen debug/info. Niet leidend voor echte server trade-resultaten."""
     reason = clean(data.get("exit_reason")) or clean(data.get("reason"))
     if action == "BTC_BUY":
         return f"Reden: {reason}\n" if reason else ""
@@ -260,22 +293,67 @@ def trade_text(data, action, price):
     if not points and buy and sell:
         points = str(fval(sell) - fval(buy))
     if not result and points:
-        p = fval(points)
-        result = "WIN" if p > 0 else "LOSS" if p < 0 else "FLAT"
+        result = result_from_points(points)
 
     lines = []
     if buy:
-        lines.append(f"BUY: {fmt(buy, 1)}")
+        lines.append(f"PINE BUY: {fmt(buy, 1)}")
     if sell:
-        lines.append(f"SELL: {fmt(sell, 1)}")
+        lines.append(f"PINE SELL: {fmt(sell, 1)}")
     if points:
-        lines.append(f"TRADE: {pts(points)} punten")
+        lines.append(f"PINE TRADE: {pts(points)} punten")
     if result:
-        lines.append(f"RESULT: {result}")
+        lines.append(f"PINE RESULT: {result}")
+    if reason:
+        lines.append(f"PINE REASON: {reason}")
+
+    return "Pine info/debug\n" + "\n".join(lines) + "\n" if lines else ""
+
+
+def get_pine_entry(data):
+    return (
+        clean(data.get("trade_buy"))
+        or clean(data.get("trade_entry_price"))
+        or clean(data.get("entry_price"))
+    )
+
+
+def server_trade_result_text(entry_price, exit_price, volume, reason="", pine_entry="", order_id_value=""):
+    entry = fval(entry_price, None)
+    exitp = fval(exit_price, None)
+    vol = fval(volume, 0.0)
+
+    lines = ["Server trade resultaat"]
+    if entry is not None:
+        lines.append(f"SERVER BUY: {fmt(entry, 1)}")
+    if exitp is not None:
+        lines.append(f"SERVER SELL: {fmt(exitp, 1)}")
+    if vol > 0:
+        lines.append(f"SERVER VOLUME: {vol:.8f} BTC")
+    if entry is not None and exitp is not None:
+        trade_points = exitp - entry
+        gross_eur = trade_points * vol
+        lines.append(f"SERVER TRADE: {pts(trade_points)} punten")
+        lines.append(f"SERVER GROSS EUR: {gross_eur:+.4f}")
+        lines.append(f"SERVER RESULT: {result_from_points(trade_points)}")
+    if order_id_value:
+        lines.append(f"SELL ORDER ID: {order_id_value}")
     if reason:
         lines.append(f"REASON: {reason}")
 
-    return "Trade resultaat\n" + "\n".join(lines) + "\n" if lines else ""
+    if pine_entry:
+        pine = fval(pine_entry, None)
+        if pine is not None and entry is not None:
+            diff = pine - entry
+            lines.append("")
+            lines.append("Controle Pine vs server")
+            lines.append(f"PINE ENTRY: {fmt(pine, 1)}")
+            lines.append(f"SERVER ENTRY: {fmt(entry, 1)}")
+            lines.append(f"VERSCHIL: {pts(diff)} punten")
+            if abs(diff) >= 1.0:
+                lines.append("LET OP - Pine-entry wijkt af. Server/Kraken-resultaat is leidend.")
+
+    return "\n".join(lines) + "\n"
 
 
 def base_message(data):
@@ -291,7 +369,7 @@ Timeframe: {clean(data.get("timeframe")) or clean(data.get("tf"))}
 
 def blocked_message(data, reason):
     s = load_state()
-    return base_message(data) + trade_text(data, clean(data.get("action")), clean(data.get("price"))) + f"""
+    return base_message(data) + pine_trade_text(data, clean(data.get("action")), clean(data.get("price"))) + f"""
 
 LET OP - Kraken-order NIET uitgevoerd
 
@@ -325,42 +403,105 @@ KRAKEN_API_SECRET_SET={bool(KRAKEN_API_SECRET)}
 
 Server bot-state:
 bot_position_btc={s.get("bot_position_btc")}
-last_action={s.get("last_action")}
+avg_entry_price={s.get("avg_entry_price")}
 last_buy_price={s.get("last_buy_price")}
+last_buy_volume={s.get("last_buy_volume")}
+last_buy_order_id={s.get("last_buy_order_id")}
 last_sell_price={s.get("last_sell_price")}
+last_trade_points={s.get("last_trade_points")}
+last_trade_result={s.get("last_trade_result")}
 open_trade_id={s.get("open_trade_id")}
 """
 
 
 def update_buy_state(volume, price, oid):
     s = load_state()
-    pos = fval(s.get("bot_position_btc"), 0.0)
-    s["bot_position_btc"] = round(pos + volume, 8)
-    s["last_buy_price"] = fval(price, None)
+    old_pos = fval(s.get("bot_position_btc"), 0.0)
+    buy_price = fval(price, None)
+    old_avg = fval(s.get("avg_entry_price"), None)
+
+    new_pos = round(old_pos + volume, 8)
+    if buy_price is not None:
+        if old_pos >= MIN_BTC_VOLUME and old_avg is not None:
+            new_avg = ((old_pos * old_avg) + (volume * buy_price)) / new_pos
+        else:
+            new_avg = buy_price
+    else:
+        new_avg = old_avg
+
+    s["bot_position_btc"] = new_pos
+    s["last_buy_price"] = buy_price
+    s["avg_entry_price"] = new_avg
+    s["last_buy_volume"] = volume
     s["last_buy_order_id"] = oid
+    s["last_buy_ts"] = int(time.time())
     s["last_action"] = "BUY"
-    s["open_trade_id"] = oid or f"buy-{int(time.time())}"
+    s["open_trade_id"] = s.get("open_trade_id") or oid or f"buy-{int(time.time())}"
     save_state(s)
+    return s
 
 
-def update_sell_state(volume, price, oid):
+def update_sell_state(volume, price, oid, data):
     s = load_state()
-    pos = fval(s.get("bot_position_btc"), 0.0)
-    new_pos = max(0.0, pos - volume)
+    old_pos = fval(s.get("bot_position_btc"), 0.0)
+    entry_price = fval(s.get("avg_entry_price"), None)
+    last_buy_price = fval(s.get("last_buy_price"), None)
+    if entry_price is None:
+        entry_price = last_buy_price
+
+    sell_price = fval(price, None)
+    pine_entry = get_pine_entry(data)
+    pine_entry_float = fval(pine_entry, None)
+
+    trade_points = None
+    gross_eur = None
+    trade_result = None
+    warning = ""
+
+    if entry_price is not None and sell_price is not None:
+        trade_points = sell_price - entry_price
+        gross_eur = trade_points * volume
+        trade_result = result_from_points(trade_points)
+
+    if pine_entry_float is not None and entry_price is not None:
+        diff = pine_entry_float - entry_price
+        s["last_pine_entry_diff"] = diff
+        if abs(diff) >= 1.0:
+            warning = "Pine-entry wijkt af van server-entry. Server-resultaat is leidend."
+
+    new_pos = max(0.0, old_pos - volume)
     s["bot_position_btc"] = round(new_pos, 8)
-    s["last_sell_price"] = fval(price, None)
+    s["last_sell_price"] = sell_price
+    s["last_sell_volume"] = volume
     s["last_sell_order_id"] = oid
+    s["last_sell_ts"] = int(time.time())
     s["last_action"] = "SELL"
+    s["last_trade_points"] = trade_points
+    s["last_trade_gross_eur"] = gross_eur
+    s["last_trade_result"] = trade_result
+    s["last_trade_entry_price"] = entry_price
+    s["last_trade_exit_price"] = sell_price
+    s["last_trade_volume"] = volume
+    s["last_pine_entry_price"] = pine_entry_float
+    s["last_pine_result_warning"] = warning
+
     if new_pos < MIN_BTC_VOLUME:
         s["open_trade_id"] = None
         s["closed_trades"] = int(s.get("closed_trades", 0) or 0) + 1
+        s["avg_entry_price"] = None
+    else:
+        # Partial sell: keep avg_entry_price for remaining bot position.
+        s["avg_entry_price"] = entry_price
+
     save_state(s)
+    return s
 
 
 @app.route("/")
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot draait",
+        "version": "app.py V9.14H SERVER RESULT FIX",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state": load_state()
@@ -370,6 +511,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
+        "version": "app.py V9.14H SERVER RESULT FIX",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -382,7 +524,8 @@ def status():
             "EXCHANGE": EXCHANGE_ENV,
             "MARKET": MARKET_ENV,
             "KRAKEN_API_KEY_SET": bool(KRAKEN_API_KEY),
-            "KRAKEN_API_SECRET_SET": bool(KRAKEN_API_SECRET)
+            "KRAKEN_API_SECRET_SET": bool(KRAKEN_API_SECRET),
+            "BOT_STATE_FILE": STATE_FILE
         },
         "state": load_state()
     })
@@ -408,6 +551,7 @@ def webhook():
     price = clean(data.get("price"))
     bot = clean(data.get("bot"))
     ticker = clean(data.get("ticker"))
+    reason = clean(data.get("exit_reason")) or clean(data.get("reason"))
 
     if not supported_bot(data):
         send_telegram(blocked_message(data, "Bot/ticker/action wordt niet herkend als ondersteunde Kraken BTC bot."))
@@ -440,7 +584,7 @@ def webhook():
         res = kraken_buy(volume)
         if order_ok(res):
             oid = order_id(res)
-            update_buy_state(volume_float, price, oid)
+            new_state = update_buy_state(volume_float, price, oid)
             msg = f"""OK - Kraken BUY uitgevoerd
 
 Bot: {bot}
@@ -449,9 +593,14 @@ Prijs: {price}
 Amount: {volume} BTC
 Order ID: {oid}
 Reden: {clean(data.get("reason"))}
+
+Server positie:
+bot_position_btc: {new_state.get("bot_position_btc")}
+avg_entry_price: {fmt(new_state.get("avg_entry_price"), 1)}
+last_buy_price: {fmt(new_state.get("last_buy_price"), 1)}
 """
         else:
-            msg = base_message(data) + trade_text(data, action, price) + f"""
+            msg = base_message(data) + pine_trade_text(data, action, price) + f"""
 
 LET OP - Kraken BUY NIET uitgevoerd
 
@@ -476,10 +625,15 @@ Kraken result:
             send_telegram(blocked_message(data, f"SELL genegeerd: onvoldoende verkoopbaar BTC. Botpositie: {bot_pos:.8f}, Kraken saldo: {btc_balance:.8f}, gevraagd: {volume}."))
             return "ok", 200
 
+        # Capture server entry before state changes.
+        entry_before = fval(state.get("avg_entry_price"), None)
+        if entry_before is None:
+            entry_before = fval(state.get("last_buy_price"), None)
+
         res = kraken_sell(f"{sell_volume:.8f}")
         if order_ok(res):
             oid = order_id(res)
-            update_sell_state(sell_volume, price, oid)
+            new_state = update_sell_state(sell_volume, price, oid, data)
             msg = f"""OK - Kraken SELL uitgevoerd
 
 Bot: {bot}
@@ -488,9 +642,20 @@ Prijs: {price}
 Amount: {sell_volume:.8f} BTC
 Order ID: {oid}
 
-""" + trade_text(data, action, price)
+""" + server_trade_result_text(
+                entry_price=entry_before,
+                exit_price=price,
+                volume=sell_volume,
+                reason=reason,
+                pine_entry=get_pine_entry(data),
+                order_id_value=oid
+            ) + f"""
+Server positie na SELL:
+bot_position_btc: {new_state.get("bot_position_btc")}
+closed_trades: {new_state.get("closed_trades")}
+"""
         else:
-            msg = base_message(data) + trade_text(data, action, price) + f"""
+            msg = base_message(data) + pine_trade_text(data, action, price) + f"""
 
 LET OP - Kraken SELL NIET uitgevoerd
 

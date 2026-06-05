@@ -180,21 +180,67 @@ def json_live_requested(data):
 
 
 def supported_bot(data):
+    """
+    Ruime maar veilige herkenning voor Rene/RBT Kraken BTC spot bots.
+
+    Waarom ruimer:
+    Nieuwe Pine-versies zoals V9.15E LIVE KRAKEN STARTER ROUTING GUARD
+    kunnen anders door Render worden geweigerd met:
+    'Bot/ticker/action wordt niet herkend als ondersteunde Kraken BTC bot.'
+
+    Veiligheidsgrenzen blijven:
+    - Alleen BTC/EUR tickers.
+    - Alleen BTC_BUY en BTC_EXIT.
+    - Alleen als de alert duidelijk live Kraken/RBT/Rene context heeft,
+      of expliciet kraken_order / trade_mode KRAKEN_LIVE meestuurt.
+    """
     bot = clean(data.get("bot")).upper()
     ticker = clean(data.get("ticker")).upper()
     action = clean(data.get("action"))
     version = clean(data.get("v_version")).upper()
     strategy = clean(data.get("strategy_base")).upper()
+    mode = clean(data.get("mode")).upper()
+    trade_mode = clean(data.get("trade_mode")).upper()
 
-    ticker_ok = ticker in ["BTCEUR", "BTCEUR.P", "XBT/EUR", "XBTEUR"]
+    ticker_clean = ticker.replace("/", "").replace("-", "").replace(".", "")
+    ticker_ok = ticker_clean in [
+        "BTCEUR",
+        "XBTEUR",
+        "XBTEURP",
+        "XBTEURPERP",
+        "XXBTZEUR",
+        "XXBTZEURP",
+    ]
+
     action_ok = action in ["BTC_BUY", "BTC_EXIT"]
-    bot_ok = (
-        "RENE BTC SPOT BOT KRAKEN" in bot
-        or ("RBT" in bot and "KRAKEN" in bot)
-        or "KRAKEN" in version
-        or "KRAKEN" in strategy
+
+    text_blob = " ".join([bot, version, strategy, mode, trade_mode]).upper()
+
+    rbt_or_rene = (
+        "RBT" in text_blob
+        or "RENE" in text_blob
+        or "BTC SPOT BOT" in text_blob
     )
-    return ticker_ok and action_ok and bot_ok
+
+    kraken_context = (
+        "KRAKEN" in text_blob
+        or bval(data.get("kraken_order"))
+        or trade_mode == "KRAKEN_LIVE"
+        or mode == "KRAKEN_LIVE"
+        or EXCHANGE_ENV.lower() == "kraken"
+    )
+
+    live_context = (
+        bval(data.get("live"))
+        or bval(data.get("is_live"))
+        or bval(data.get("place_order"))
+        or bval(data.get("execute"))
+        or bval(data.get("live_order"))
+        or trade_mode == "KRAKEN_LIVE"
+        or mode == "KRAKEN_LIVE"
+    )
+
+    return ticker_ok and action_ok and rbt_or_rene and kraken_context and live_context
 
 
 def kraken_signature(urlpath, data, secret):
@@ -501,7 +547,7 @@ def update_sell_state(volume, price, oid, data):
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot draait",
-        "version": "app.py V9.14H SERVER RESULT FIX",
+        "version": "app.py V9.15E BOT RECOGNITION FIX",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state": load_state()
@@ -511,7 +557,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.14H SERVER RESULT FIX",
+        "version": "app.py V9.15E BOT RECOGNITION FIX",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,

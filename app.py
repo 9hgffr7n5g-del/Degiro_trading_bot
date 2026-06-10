@@ -8,6 +8,11 @@ import hashlib
 import urllib.parse
 import requests
 from threading import Lock
+from datetime import datetime, timedelta, timezone
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 app = Flask(__name__)
 
@@ -31,8 +36,17 @@ PAIR = os.environ.get("KRAKEN_PAIR", "XBTEUR")
 DEFAULT_BTC_VOLUME = os.environ.get("DEFAULT_BTC_VOLUME", "0.00010")
 MIN_BTC_VOLUME = float(os.environ.get("MIN_BTC_VOLUME", "0.00010"))
 
-STATE_FILE = os.environ.get("BOT_STATE_FILE", "bot_state.json")
+# Zet op Render bij voorkeur:
+# BOT_STATE_FILE=/data/bot_state.json
+# TRADE_LOG_FILE=/data/trades.json
+# APP_TZ=Europe/Amsterdam
+STATE_FILE = os.environ.get("BOT_STATE_FILE", "/data/bot_state.json" if os.path.isdir("/data") else "bot_state.json")
+TRADE_LOG_FILE = os.environ.get("TRADE_LOG_FILE", "/data/trades.json" if os.path.isdir("/data") else "trades.json")
+APP_TZ = os.environ.get("APP_TZ", "Europe/Amsterdam")
+ROUND_TRIP_COST_POINTS = float(os.environ.get("ROUND_TRIP_COST_POINTS", "0.0"))
+
 STATE_LOCK = Lock()
+TRADE_LOCK = Lock()
 
 DEFAULT_STATE = {
     "bot_position_btc": 0.0,
@@ -51,6 +65,8 @@ DEFAULT_STATE = {
     "open_trade_id": None,
     "last_trade_points": None,
     "last_trade_gross_eur": None,
+    "last_trade_net_points_est": None,
+    "last_trade_net_eur_est": None,
     "last_trade_result": None,
     "last_trade_entry_price": None,
     "last_trade_exit_price": None,
@@ -58,8 +74,40 @@ DEFAULT_STATE = {
     "last_pine_entry_price": None,
     "last_pine_entry_diff": None,
     "last_pine_result_warning": "",
+    "last_telegram_ok": None,
+    "last_telegram_error": "",
+    "last_telegram_ts": None,
     "server_started_ts": int(time.time())
 }
+
+
+def ensure_parent(path):
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
+
+def now_ts():
+    return int(time.time())
+
+
+def local_dt(ts=None):
+    if ts is None:
+        ts = now_ts()
+    if ZoneInfo:
+        try:
+            return datetime.fromtimestamp(int(ts), ZoneInfo(APP_TZ))
+        except Exception:
+            pass
+    return datetime.fromtimestamp(int(ts), timezone.utc)
+
+
+def local_date_str(ts=None):
+    return local_dt(ts).strftime("%Y-%m-%d")
+
+
+def local_time_str(ts=None):
+    return local_dt(ts).strftime("%d-%m-%Y %H:%M:%S")
 
 
 def clean(value):
@@ -94,6 +142,15 @@ def fmt(value, decimals=1):
         return str(value)
 
 
+def fmt_eur(value, decimals=4):
+    try:
+        x = float(value)
+        sign = "+" if x > 0 else ""
+        return f"{sign}â¬{x:.{decimals}f}"
+    except Exception:
+        return str(value)
+
+
 def pts(value):
     try:
         x = float(value)
@@ -112,16 +169,48 @@ def result_from_points(points_value):
     return "FLAT"
 
 
+def nl_result(result):
+    r = clean(result).upper()
+    if r == "WIN":
+        return "WIN"
+    if r == "LOSS":
+        return "LOSS"
+    return "FLAT"
+
+
+def update_telegram_state(ok, error=""):
+    try:
+        s = load_state()
+        s["last_telegram_ok"] = bool(ok)
+        s["last_telegram_error"] = clean(error)
+        s["last_telegram_ts"] = now_ts()
+        save_state(s)
+    except Exception as e:
+        print("Telegram state update error:", e)
+
+
 def send_telegram(message):
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram not configured")
         print(message)
-        return
+        update_telegram_state(False, "BOT_TOKEN of CHAT_ID ontbreekt")
+        return False
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=15)
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=15)
+        if 200 <= r.status_code < 300:
+            update_telegram_state(True, "")
+            return True
+        err = f"HTTP {r.status_code}: {r.text[:300]}"
+        print("Telegram error:", err)
+        update_telegram_state(False, err)
+        return False
     except Exception as e:
-        print("Telegram error:", e)
+        err = str(e)
+        print("Telegram error:", err)
+        update_telegram_state(False, err)
+        return False
 
 
 def load_state():
@@ -140,16 +229,200 @@ def load_state():
 
 def save_state(state):
     with STATE_LOCK:
-        state["last_update_ts"] = int(time.time())
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
+        try:
+            ensure_parent(STATE_FILE)
+            state["last_update_ts"] = now_ts()
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print("State save error:", e)
+            raise
 
 
 def reset_state():
     s = DEFAULT_STATE.copy()
-    s["server_started_ts"] = int(time.time())
+    s["server_started_ts"] = now_ts()
     save_state(s)
     return s
+
+
+def load_trades():
+    with TRADE_LOCK:
+        try:
+            if os.path.exists(TRADE_LOG_FILE):
+                with open(TRADE_LOG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception as e:
+            print("Trade log load error:", e)
+        return []
+
+
+def save_trades(trades):
+    with TRADE_LOCK:
+        ensure_parent(TRADE_LOG_FILE)
+        with open(TRADE_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(trades, f, indent=2)
+
+
+def append_trade_event(event):
+    trades = load_trades()
+    event = dict(event)
+    event.setdefault("ts", now_ts())
+    event.setdefault("tijd", local_time_str(event.get("ts")))
+    event.setdefault("datum", local_date_str(event.get("ts")))
+    trades.append(event)
+    save_trades(trades)
+    return event
+
+
+def closed_trade_events(start_ts=None, end_ts=None):
+    events = []
+    for e in load_trades():
+        if e.get("type") != "CLOSED_TRADE":
+            continue
+        ts = int(e.get("ts") or 0)
+        if start_ts is not None and ts < start_ts:
+            continue
+        if end_ts is not None and ts >= end_ts:
+            continue
+        events.append(e)
+    return events
+
+
+def summarize_closed_trades(events):
+    total = len(events)
+    wins = sum(1 for e in events if clean(e.get("result")).upper() == "WIN")
+    losses = sum(1 for e in events if clean(e.get("result")).upper() == "LOSS")
+    flats = total - wins - losses
+    points = sum(fval(e.get("points"), 0.0) for e in events)
+    gross_eur = sum(fval(e.get("gross_eur"), 0.0) for e in events)
+    net_points_est = sum(fval(e.get("net_points_est"), fval(e.get("points"), 0.0)) for e in events)
+    net_eur_est = sum(fval(e.get("net_eur_est"), fval(e.get("gross_eur"), 0.0)) for e in events)
+    best = max(events, key=lambda e: fval(e.get("points"), 0.0), default=None)
+    worst = min(events, key=lambda e: fval(e.get("points"), 0.0), default=None)
+    winrate = (wins / total * 100.0) if total else 0.0
+    return {
+        "closed_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "flats": flats,
+        "winrate": winrate,
+        "points": points,
+        "gross_eur": gross_eur,
+        "net_points_est": net_points_est,
+        "net_eur_est": net_eur_est,
+        "best": best,
+        "worst": worst
+    }
+
+
+def day_bounds(date_str=None):
+    if date_str:
+        y, m, d = [int(x) for x in date_str.split("-")]
+        tz = ZoneInfo(APP_TZ) if ZoneInfo else timezone.utc
+        start_dt = datetime(y, m, d, 0, 0, 0, tzinfo=tz)
+    else:
+        now = local_dt()
+        start_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = start_dt + timedelta(days=1)
+    return int(start_dt.timestamp()), int(end_dt.timestamp())
+
+
+def week_bounds(date_str=None):
+    if date_str:
+        y, m, d = [int(x) for x in date_str.split("-")]
+        tz = ZoneInfo(APP_TZ) if ZoneInfo else timezone.utc
+        dt = datetime(y, m, d, 12, 0, 0, tzinfo=tz)
+    else:
+        dt = local_dt()
+    start_dt = (dt - timedelta(days=dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = start_dt + timedelta(days=7)
+    return int(start_dt.timestamp()), int(end_dt.timestamp())
+
+
+def format_daily_summary(date_str=None):
+    start, end = day_bounds(date_str)
+    events = closed_trade_events(start, end)
+    s = summarize_closed_trades(events)
+    state = load_state()
+    title_date = local_dt(start).strftime("%d-%m-%Y")
+
+    lines = [
+        "ð RBT DAGOVERZICHT",
+        "",
+        f"Datum: {title_date}",
+        f"Gesloten trades: {s['closed_trades']}",
+        f"Winsttrades: {s['wins']}",
+        f"Verliestrades: {s['losses']}",
+        f"Winrate: {s['winrate']:.1f}%",
+        f"Punten bruto: {pts(s['points'])}",
+        f"Bruto resultaat: {fmt_eur(s['gross_eur'])}",
+        f"Geschat netto: {fmt_eur(s['net_eur_est'])}",
+    ]
+
+    if s["best"]:
+        lines.append(f"Beste trade: {pts(s['best'].get('points'))} punten")
+    if s["worst"]:
+        lines.append(f"Slechtste trade: {pts(s['worst'].get('points'))} punten")
+
+    lines += [
+        "",
+        "Open positie:",
+        f"BTC: {fval(state.get('bot_position_btc'), 0.0):.8f}",
+        f"Gemiddelde instap: {fmt(state.get('avg_entry_price'), 1)}",
+        f"Laatste actie: {clean(state.get('last_action'))}",
+    ]
+
+    return "\n".join(lines)
+
+
+def format_weekly_summary(date_str=None):
+    start, end = week_bounds(date_str)
+    events = closed_trade_events(start, end)
+    s = summarize_closed_trades(events)
+    state = load_state()
+
+    day_lines = []
+    for i in range(7):
+        d_start = start + i * 86400
+        d_end = d_start + 86400
+        d_events = closed_trade_events(d_start, d_end)
+        ds = summarize_closed_trades(d_events)
+        day_name = local_dt(d_start).strftime("%a %d-%m")
+        day_lines.append(f"{day_name}: {pts(ds['points'])} punten ({ds['closed_trades']} trades)")
+
+    lines = [
+        "ð RBT WEEKOVERZICHT",
+        "",
+        f"Week vanaf: {local_dt(start).strftime('%d-%m-%Y')}",
+        "",
+        *day_lines,
+        "",
+        f"Week totaal punten: {pts(s['points'])}",
+        f"Bruto resultaat: {fmt_eur(s['gross_eur'])}",
+        f"Geschat netto: {fmt_eur(s['net_eur_est'])}",
+        f"Gesloten trades: {s['closed_trades']}",
+        f"Winsttrades: {s['wins']}",
+        f"Verliestrades: {s['losses']}",
+        f"Winrate: {s['winrate']:.1f}%",
+    ]
+
+    if s["best"]:
+        lines.append(f"Beste trade: {pts(s['best'].get('points'))} punten")
+    if s["worst"]:
+        lines.append(f"Slechtste trade: {pts(s['worst'].get('points'))} punten")
+
+    lines += [
+        "",
+        "Open positie:",
+        f"BTC: {fval(state.get('bot_position_btc'), 0.0):.8f}",
+        f"Gemiddelde instap: {fmt(state.get('avg_entry_price'), 1)}",
+        f"Laatste actie: {clean(state.get('last_action'))}",
+    ]
+
+    return "\n".join(lines)
 
 
 def env_live_allowed():
@@ -180,20 +453,6 @@ def json_live_requested(data):
 
 
 def supported_bot(data):
-    """
-    Ruime maar veilige herkenning voor Rene/RBT Kraken BTC spot bots.
-
-    Waarom ruimer:
-    Nieuwe Pine-versies zoals V9.15E LIVE KRAKEN STARTER ROUTING GUARD
-    kunnen anders door Render worden geweigerd met:
-    'Bot/ticker/action wordt niet herkend als ondersteunde Kraken BTC bot.'
-
-    Veiligheidsgrenzen blijven:
-    - Alleen BTC/EUR tickers.
-    - Alleen BTC_BUY en BTC_EXIT.
-    - Alleen als de alert duidelijk live Kraken/RBT/Rene context heeft,
-      of expliciet kraken_order / trade_mode KRAKEN_LIVE meestuurt.
-    """
     bot = clean(data.get("bot")).upper()
     ticker = clean(data.get("ticker")).upper()
     action = clean(data.get("action"))
@@ -326,7 +585,6 @@ def get_volume(data, action):
 
 
 def pine_trade_text(data, action, price):
-    """Alleen debug/info. Niet leidend voor echte server trade-resultaten."""
     reason = clean(data.get("exit_reason")) or clean(data.get("reason"))
     if action == "BTC_BUY":
         return f"Reden: {reason}\n" if reason else ""
@@ -362,44 +620,6 @@ def get_pine_entry(data):
         or clean(data.get("trade_entry_price"))
         or clean(data.get("entry_price"))
     )
-
-
-def server_trade_result_text(entry_price, exit_price, volume, reason="", pine_entry="", order_id_value=""):
-    entry = fval(entry_price, None)
-    exitp = fval(exit_price, None)
-    vol = fval(volume, 0.0)
-
-    lines = ["Server trade resultaat"]
-    if entry is not None:
-        lines.append(f"SERVER BUY: {fmt(entry, 1)}")
-    if exitp is not None:
-        lines.append(f"SERVER SELL: {fmt(exitp, 1)}")
-    if vol > 0:
-        lines.append(f"SERVER VOLUME: {vol:.8f} BTC")
-    if entry is not None and exitp is not None:
-        trade_points = exitp - entry
-        gross_eur = trade_points * vol
-        lines.append(f"SERVER TRADE: {pts(trade_points)} punten")
-        lines.append(f"SERVER GROSS EUR: {gross_eur:+.4f}")
-        lines.append(f"SERVER RESULT: {result_from_points(trade_points)}")
-    if order_id_value:
-        lines.append(f"SELL ORDER ID: {order_id_value}")
-    if reason:
-        lines.append(f"REASON: {reason}")
-
-    if pine_entry:
-        pine = fval(pine_entry, None)
-        if pine is not None and entry is not None:
-            diff = pine - entry
-            lines.append("")
-            lines.append("Controle Pine vs server")
-            lines.append(f"PINE ENTRY: {fmt(pine, 1)}")
-            lines.append(f"SERVER ENTRY: {fmt(entry, 1)}")
-            lines.append(f"VERSCHIL: {pts(diff)} punten")
-            if abs(diff) >= 1.0:
-                lines.append("LET OP - Pine-entry wijkt af. Server/Kraken-resultaat is leidend.")
-
-    return "\n".join(lines) + "\n"
 
 
 def base_message(data):
@@ -480,9 +700,9 @@ def update_buy_state(volume, price, oid):
     s["avg_entry_price"] = new_avg
     s["last_buy_volume"] = volume
     s["last_buy_order_id"] = oid
-    s["last_buy_ts"] = int(time.time())
+    s["last_buy_ts"] = now_ts()
     s["last_action"] = "BUY"
-    s["open_trade_id"] = s.get("open_trade_id") or oid or f"buy-{int(time.time())}"
+    s["open_trade_id"] = s.get("open_trade_id") or oid or f"buy-{now_ts()}"
     save_state(s)
     return s
 
@@ -501,12 +721,16 @@ def update_sell_state(volume, price, oid, data):
 
     trade_points = None
     gross_eur = None
+    net_points_est = None
+    net_eur_est = None
     trade_result = None
     warning = ""
 
     if entry_price is not None and sell_price is not None:
         trade_points = sell_price - entry_price
         gross_eur = trade_points * volume
+        net_points_est = trade_points - ROUND_TRIP_COST_POINTS
+        net_eur_est = net_points_est * volume
         trade_result = result_from_points(trade_points)
 
     if pine_entry_float is not None and entry_price is not None:
@@ -520,10 +744,12 @@ def update_sell_state(volume, price, oid, data):
     s["last_sell_price"] = sell_price
     s["last_sell_volume"] = volume
     s["last_sell_order_id"] = oid
-    s["last_sell_ts"] = int(time.time())
+    s["last_sell_ts"] = now_ts()
     s["last_action"] = "SELL"
     s["last_trade_points"] = trade_points
     s["last_trade_gross_eur"] = gross_eur
+    s["last_trade_net_points_est"] = net_points_est
+    s["last_trade_net_eur_est"] = net_eur_est
     s["last_trade_result"] = trade_result
     s["last_trade_entry_price"] = entry_price
     s["last_trade_exit_price"] = sell_price
@@ -536,20 +762,115 @@ def update_sell_state(volume, price, oid, data):
         s["closed_trades"] = int(s.get("closed_trades", 0) or 0) + 1
         s["avg_entry_price"] = None
     else:
-        # Partial sell: keep avg_entry_price for remaining bot position.
         s["avg_entry_price"] = entry_price
 
     save_state(s)
     return s
 
 
+def buy_message(bot, ticker, price, volume, oid, reason, state):
+    return f"""â KRAKEN BUY UITGEVOERD
+
+Bot: {bot}
+Ticker: {ticker}
+Prijs: {fmt(price, 1)}
+Aantal BTC: {float(volume):.8f}
+Order-ID: {oid}
+Reden: {reason}
+
+Serverpositie:
+BTC: {fval(state.get("bot_position_btc"), 0.0):.8f}
+Gemiddelde instap: {fmt(state.get("avg_entry_price"), 1)}
+Laatste koopprijs: {fmt(state.get("last_buy_price"), 1)}
+Tijd: {local_time_str()}
+"""
+
+
+def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, pine_entry):
+    entry = fval(entry_before, None)
+    exitp = fval(price, None)
+    vol = fval(volume, 0.0)
+    points = None
+    gross_eur = None
+    net_points = None
+    net_eur = None
+    result = "FLAT"
+
+    if entry is not None and exitp is not None:
+        points = exitp - entry
+        gross_eur = points * vol
+        net_points = points - ROUND_TRIP_COST_POINTS
+        net_eur = net_points * vol
+        result = result_from_points(points)
+
+    day_start, day_end = day_bounds()
+    week_start, week_end = week_bounds()
+    day_sum = summarize_closed_trades(closed_trade_events(day_start, day_end))
+    week_sum = summarize_closed_trades(closed_trade_events(week_start, week_end))
+
+    lines = [
+        "â KRAKEN SELL UITGEVOERD",
+        "",
+        f"Bot: {bot}",
+        f"Ticker: {ticker}",
+        f"Uitstap: {fmt(price, 1)}",
+        f"Aantal BTC: {vol:.8f}",
+        f"Order-ID: {oid}",
+        f"Reden: {reason}",
+        "",
+        "Trade-resultaat:",
+        f"Instap: {fmt(entry, 1)}",
+        f"Uitstap: {fmt(exitp, 1)}",
+        f"Punten bruto: {pts(points)}",
+        f"Bruto resultaat: {fmt_eur(gross_eur)}",
+        f"Geschat netto: {fmt_eur(net_eur)}",
+        f"Resultaat: {nl_result(result)}",
+    ]
+
+    pine = fval(pine_entry, None)
+    if pine is not None and entry is not None:
+        diff = pine - entry
+        lines += [
+            "",
+            "Controle Pine vs server:",
+            f"Pine instap: {fmt(pine, 1)}",
+            f"Server instap: {fmt(entry, 1)}",
+            f"Verschil: {pts(diff)} punten",
+        ]
+        if abs(diff) >= 1.0:
+            lines.append("LET OP: server/Kraken-resultaat is leidend.")
+
+    lines += [
+        "",
+        "Dag totaal:",
+        f"Punten bruto: {pts(day_sum['points'])}",
+        f"Geschat netto: {fmt_eur(day_sum['net_eur_est'])}",
+        f"Gesloten trades: {day_sum['closed_trades']}",
+        "",
+        "Week totaal:",
+        f"Punten bruto: {pts(week_sum['points'])}",
+        f"Geschat netto: {fmt_eur(week_sum['net_eur_est'])}",
+        f"Gesloten trades: {week_sum['closed_trades']}",
+        "",
+        "Serverpositie na SELL:",
+        f"BTC: {fval(state.get('bot_position_btc'), 0.0):.8f}",
+        f"Gesloten trades totaal: {state.get('closed_trades')}",
+        f"Tijd: {local_time_str()}",
+    ]
+
+    return "\n".join(lines)
+
+
 @app.route("/")
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot draait",
-        "version": "app.py V9.15E BOT RECOGNITION FIX",
+        "version": "app.py V9.16 TRADE LOG NL TELEGRAM",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
+        "state_file": STATE_FILE,
+        "trade_log_file": TRADE_LOG_FILE,
+        "timezone": APP_TZ,
         "state": load_state()
     })
 
@@ -557,7 +878,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.15E BOT RECOGNITION FIX",
+        "version": "app.py V9.16 TRADE LOG NL TELEGRAM",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -571,10 +892,52 @@ def status():
             "MARKET": MARKET_ENV,
             "KRAKEN_API_KEY_SET": bool(KRAKEN_API_KEY),
             "KRAKEN_API_SECRET_SET": bool(KRAKEN_API_SECRET),
-            "BOT_STATE_FILE": STATE_FILE
+            "BOT_STATE_FILE": STATE_FILE,
+            "TRADE_LOG_FILE": TRADE_LOG_FILE,
+            "APP_TZ": APP_TZ,
+            "ROUND_TRIP_COST_POINTS": ROUND_TRIP_COST_POINTS
         },
         "state": load_state()
     })
+
+
+@app.route("/trades")
+def trades_route():
+    limit = int(request.args.get("limit", "100"))
+    data = load_trades()
+    return jsonify({
+        "count": len(data),
+        "showing": min(limit, len(data)),
+        "trades": data[-limit:]
+    })
+
+
+@app.route("/daily_summary")
+def daily_summary_route():
+    date_str = request.args.get("date")
+    return "<pre>" + format_daily_summary(date_str) + "</pre>"
+
+
+@app.route("/weekly_summary")
+def weekly_summary_route():
+    date_str = request.args.get("date")
+    return "<pre>" + format_weekly_summary(date_str) + "</pre>"
+
+
+@app.route("/send_daily_summary", methods=["GET", "POST"])
+def send_daily_summary_route():
+    date_str = request.args.get("date")
+    msg = format_daily_summary(date_str)
+    ok = send_telegram(msg)
+    return jsonify({"ok": ok, "message": msg})
+
+
+@app.route("/send_weekly_summary", methods=["GET", "POST"])
+def send_weekly_summary_route():
+    date_str = request.args.get("date")
+    msg = format_weekly_summary(date_str)
+    ok = send_telegram(msg)
+    return jsonify({"ok": ok, "message": msg})
 
 
 @app.route("/reset_state", methods=["GET", "POST"])
@@ -586,8 +949,8 @@ def reset_state_route():
 
 @app.route("/send")
 def send_test():
-    send_telegram("TEST BERICHT VAN RENDER BOT")
-    return "test gestuurd"
+    ok = send_telegram("TEST BERICHT VAN RENDER BOT")
+    return jsonify({"ok": ok, "status": "test gestuurd"})
 
 
 @app.route("/webhook", methods=["POST"])
@@ -631,20 +994,22 @@ def webhook():
         if order_ok(res):
             oid = order_id(res)
             new_state = update_buy_state(volume_float, price, oid)
-            msg = f"""OK - Kraken BUY uitgevoerd
 
-Bot: {bot}
-Ticker: {ticker}
-Prijs: {price}
-Amount: {volume} BTC
-Order ID: {oid}
-Reden: {clean(data.get("reason"))}
+            append_trade_event({
+                "type": "ORDER",
+                "action": "BUY",
+                "bot": bot,
+                "ticker": ticker,
+                "price": fval(price, None),
+                "volume": volume_float,
+                "order_id": oid,
+                "reason": clean(data.get("reason")),
+                "server_position_btc": new_state.get("bot_position_btc"),
+                "avg_entry_price": new_state.get("avg_entry_price"),
+                "open_trade_id": new_state.get("open_trade_id")
+            })
 
-Server positie:
-bot_position_btc: {new_state.get("bot_position_btc")}
-avg_entry_price: {fmt(new_state.get("avg_entry_price"), 1)}
-last_buy_price: {fmt(new_state.get("last_buy_price"), 1)}
-"""
+            msg = buy_message(bot, ticker, price, volume, oid, clean(data.get("reason")), new_state)
         else:
             msg = base_message(data) + pine_trade_text(data, action, price) + f"""
 
@@ -671,35 +1036,75 @@ Kraken result:
             send_telegram(blocked_message(data, f"SELL genegeerd: onvoldoende verkoopbaar BTC. Botpositie: {bot_pos:.8f}, Kraken saldo: {btc_balance:.8f}, gevraagd: {volume}."))
             return "ok", 200
 
-        # Capture server entry before state changes.
         entry_before = fval(state.get("avg_entry_price"), None)
         if entry_before is None:
             entry_before = fval(state.get("last_buy_price"), None)
+
+        open_trade_id = state.get("open_trade_id")
 
         res = kraken_sell(f"{sell_volume:.8f}")
         if order_ok(res):
             oid = order_id(res)
             new_state = update_sell_state(sell_volume, price, oid, data)
-            msg = f"""OK - Kraken SELL uitgevoerd
 
-Bot: {bot}
-Ticker: {ticker}
-Prijs: {price}
-Amount: {sell_volume:.8f} BTC
-Order ID: {oid}
+            sell_price = fval(price, None)
+            trade_points = None
+            gross_eur = None
+            net_points_est = None
+            net_eur_est = None
+            result = None
+            if entry_before is not None and sell_price is not None:
+                trade_points = sell_price - entry_before
+                gross_eur = trade_points * sell_volume
+                net_points_est = trade_points - ROUND_TRIP_COST_POINTS
+                net_eur_est = net_points_est * sell_volume
+                result = result_from_points(trade_points)
 
-""" + server_trade_result_text(
-                entry_price=entry_before,
-                exit_price=price,
+            append_trade_event({
+                "type": "ORDER",
+                "action": "SELL",
+                "bot": bot,
+                "ticker": ticker,
+                "price": sell_price,
+                "volume": sell_volume,
+                "order_id": oid,
+                "reason": reason,
+                "server_position_btc": new_state.get("bot_position_btc"),
+                "open_trade_id": open_trade_id
+            })
+
+            append_trade_event({
+                "type": "CLOSED_TRADE",
+                "bot": bot,
+                "ticker": ticker,
+                "entry_price": entry_before,
+                "exit_price": sell_price,
+                "volume": sell_volume,
+                "points": trade_points,
+                "gross_eur": gross_eur,
+                "net_points_est": net_points_est,
+                "net_eur_est": net_eur_est,
+                "result": result,
+                "buy_order_id": state.get("last_buy_order_id"),
+                "sell_order_id": oid,
+                "reason": reason,
+                "open_trade_id": open_trade_id,
+                "pine_entry_price": fval(get_pine_entry(data), None),
+                "pine_entry_diff": new_state.get("last_pine_entry_diff"),
+                "warning": new_state.get("last_pine_result_warning")
+            })
+
+            msg = sell_message(
+                bot=bot,
+                ticker=ticker,
+                price=price,
                 volume=sell_volume,
+                oid=oid,
                 reason=reason,
-                pine_entry=get_pine_entry(data),
-                order_id_value=oid
-            ) + f"""
-Server positie na SELL:
-bot_position_btc: {new_state.get("bot_position_btc")}
-closed_trades: {new_state.get("closed_trades")}
-"""
+                state=new_state,
+                entry_before=entry_before,
+                pine_entry=get_pine_entry(data)
+            )
         else:
             msg = base_message(data) + pine_trade_text(data, action, price) + f"""
 

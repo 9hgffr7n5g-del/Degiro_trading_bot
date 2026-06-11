@@ -145,8 +145,11 @@ def fmt(value, decimals=1):
 def fmt_eur(value, decimals=4):
     try:
         x = float(value)
-        sign = "+" if x > 0 else ""
-        return f"{sign}â¬{x:.{decimals}f}"
+        if x > 0:
+            return f"+EUR {x:.{decimals}f}"
+        if x < 0:
+            return f"-EUR {abs(x):.{decimals}f}"
+        return f"EUR {x:.{decimals}f}"
     except Exception:
         return str(value)
 
@@ -865,7 +868,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot draait",
-        "version": "app.py V9.16 TRADE LOG NL TELEGRAM",
+        "version": "app.py V9.17 TELEGRAM EUR FIX",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -878,7 +881,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.16 TRADE LOG NL TELEGRAM",
+        "version": "app.py V9.17 TELEGRAM EUR FIX",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -949,7 +952,7 @@ def reset_state_route():
 
 @app.route("/send")
 def send_test():
-    ok = send_telegram("TEST BERICHT VAN RENDER BOT")
+    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.17 EUR FIX")
     return jsonify({"ok": ok, "status": "test gestuurd"})
 
 

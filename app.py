@@ -753,13 +753,13 @@ def tb_status_lines(state, price=None):
     open_eur, open_pct = tb_open_pnl(state, price if price is not None else state.get("last_price"))
     pos = clean(state.get("position")).upper() or "FLAT"
     return [
-        f"ð Positie: {pos}",
-        f"ð° Kapitaal: EUR {fval(state.get('capital'), TURBOBOT_START_CAPITAL):.2f}",
-        f"ð Open P/L: {fmt_eur(open_eur)} ({fmt_pct(open_pct)})",
-        f"ð Dag P/L: {fmt_eur(state.get('daily_realized_eur'))} ({fmt_pct(state.get('daily_realized_pct'))})",
-        f"ð¯ Dagtarget {TURBOBOT_DAILY_TARGET_PCT:.1f}%: {'JA' if bval(state.get('daily_target_hit')) else 'nee'}",
-        f"ð Dagstop {TURBOBOT_DAILY_STOP_PCT:.1f}%: {'JA' if bval(state.get('daily_stop_hit')) else 'nee'}",
-        f"ð¢ Trades vandaag: {int(state.get('daily_closed_trades') or 0)} / {TURBOBOT_MAX_TRADES_PER_DAY}",
+        f"Positie: {pos}",
+        f"Kapitaal: EUR {fval(state.get('capital'), TURBOBOT_START_CAPITAL):.2f}",
+        f"Open P/L: {fmt_eur(open_eur)} ({fmt_pct(open_pct)})",
+        f"Dag P/L: {fmt_eur(state.get('daily_realized_eur'))} ({fmt_pct(state.get('daily_realized_pct'))})",
+        f"Dagtarget {TURBOBOT_DAILY_TARGET_PCT:.1f}%: {'JA' if bval(state.get('daily_target_hit')) else 'nee'}",
+        f"Dagstop {TURBOBOT_DAILY_STOP_PCT:.1f}%: {'JA' if bval(state.get('daily_stop_hit')) else 'nee'}",
+        f"Trades vandaag: {int(state.get('daily_closed_trades') or 0)} / {TURBOBOT_MAX_TRADES_PER_DAY}",
     ]
 
 
@@ -767,18 +767,18 @@ def tb_format_message(kind, signal, state, price, data, extra_lines=None):
     symbol = tb_symbol_from_data(data) or clean(state.get("symbol"))
     tf = tb_timeframe_from_data(data) or clean(state.get("timeframe"))
     reason = tb_reason_from_data(data)
-    emoji = {
-        "LONG": "ð¢",
-        "SHORT": "ð´",
-        "LOCK": "ð ",
-        "CLOSE": "â",
-        "FLIP": "ð",
-        "BLOCK": "â",
-        "INFO": "â¹ï¸",
-    }.get(kind, "ð¤")
+    prefix = {
+        "LONG": "TURBOBOT LONG PAPER",
+        "SHORT": "TURBOBOT SHORT PAPER",
+        "LOCK": "TURBOBOT LOCK",
+        "CLOSE": "TURBOBOT CLOSE",
+        "FLIP": "TURBOBOT FLIP",
+        "BLOCK": "TURBOBOT BLOCK",
+        "INFO": "TURBOBOT INFO",
+    }.get(kind, "TURBOBOT")
 
     lines = [
-        f"{emoji} TURBOBOT {signal}",
+        f"{prefix}: {signal}",
         "",
         f"Ticker: {symbol}",
         f"Timeframe: {tf}",
@@ -932,7 +932,7 @@ def format_turbobot_daily_summary(date_str=None):
     state = tb_load_state()
 
     lines = [
-        "ð TURBOBOT DAGREPORT",
+        "TURBOBOT DAGREPORT",
         "",
         f"Datum: {local_dt(start).strftime('%d-%m-%Y')}",
         f"Mode: PAPER / SIGNAL ONLY",
@@ -1291,7 +1291,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot + Turbobot Paper Engine draait",
-        "version": "app.py V9.18 TURBOBOT PAPER ENGINE",
+        "version": "app.py V9.19 TURBOBOT PLAIN TEXT",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -1307,7 +1307,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.18 TURBOBOT PAPER ENGINE",
+        "version": "app.py V9.19 TURBOBOT PLAIN TEXT",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,

@@ -33,8 +33,21 @@ MARKET_ENV = os.environ.get("MARKET", "")
 
 KRAKEN_URL = "https://api.kraken.com"
 PAIR = os.environ.get("KRAKEN_PAIR", "XBTEUR")
-DEFAULT_BTC_VOLUME = os.environ.get("DEFAULT_BTC_VOLUME", "0.00010")
+
+
+def env_bval(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ["true", "1", "yes", "ja", "on"]
+
+# Afgesproken inzet: starter 0.00100 BTC, max botpositie 0.00400 BTC.
+# Render env mag dit overschrijven met DEFAULT_BTC_VOLUME of BUY_ORDER_SIZE.
+DEFAULT_BTC_VOLUME = os.environ.get("BUY_ORDER_SIZE") or os.environ.get("DEFAULT_BTC_VOLUME", "0.00100")
 MIN_BTC_VOLUME = float(os.environ.get("MIN_BTC_VOLUME", "0.00010"))
+MAX_BOT_POSITION_BTC = float(os.environ.get("MAX_BOT_POSITION_BTC", "0.00400"))
+# Veiligheid: standaard bepaalt Render de BUY-grootte, ook als Pine nog 0.00010 meestuurt.
+# Zet HONOR_TV_BUY_VOLUME=true als je later juist de TradingView JSON leidend wilt maken.
+HONOR_TV_BUY_VOLUME = env_bval(os.environ.get("HONOR_TV_BUY_VOLUME", "false"))
 
 # Zet op Render bij voorkeur:
 # BOT_STATE_FILE=/data/bot_state.json
@@ -44,6 +57,24 @@ STATE_FILE = os.environ.get("BOT_STATE_FILE", "/data/bot_state.json" if os.path.
 TRADE_LOG_FILE = os.environ.get("TRADE_LOG_FILE", "/data/trades.json" if os.path.isdir("/data") else "trades.json")
 APP_TZ = os.environ.get("APP_TZ", "Europe/Amsterdam")
 ROUND_TRIP_COST_POINTS = float(os.environ.get("ROUND_TRIP_COST_POINTS", "0.0"))
+
+
+# Render-side chop/loss guard. Pine is already close to TradingView limits,
+# so this safety layer blocks only normal BUY signals after a bad streak/day loss.
+LOSS_GUARD_ENABLED = env_bval(os.environ.get("LOSS_GUARD_ENABLED", "true"))
+LOSS_STREAK_LIMIT = int(os.environ.get("LOSS_STREAK_LIMIT", "3"))
+LOSS_GUARD_DAILY_LIMIT_EUR = float(os.environ.get("LOSS_GUARD_DAILY_LIMIT_EUR", "-15"))
+LOSS_GUARD_COOLDOWN_CANDLES = int(os.environ.get("LOSS_GUARD_COOLDOWN_CANDLES", "6"))
+LOSS_GUARD_TIMEFRAME_MIN = int(os.environ.get("LOSS_GUARD_TIMEFRAME_MIN", "5"))
+LOSS_GUARD_ALLOW_QUALITY_OVERRIDE = env_bval(os.environ.get("LOSS_GUARD_ALLOW_QUALITY_OVERRIDE", "true"))
+QUALITY_OVERRIDE_KEYWORDS = [
+    x.strip().upper()
+    for x in os.environ.get(
+        "QUALITY_OVERRIDE_KEYWORDS",
+        "ROCKET,BREAKOUT,RECLAIM,HH,HL,HHHL,TREND,SUPPORT,BOUNCE,STRONG,RECOVERY"
+    ).split(",")
+    if x.strip()
+]
 
 STATE_LOCK = Lock()
 TRADE_LOCK = Lock()
@@ -77,7 +108,12 @@ DEFAULT_STATE = {
     "last_telegram_ok": None,
     "last_telegram_error": "",
     "last_telegram_ts": None,
-    "server_started_ts": int(time.time())
+    "server_started_ts": int(time.time()),
+    "loss_guard_until_ts": 0,
+    "loss_guard_reason": "",
+    "loss_guard_last_arm_ts": 0,
+    "loss_guard_last_block_ts": 0,
+    "loss_guard_last_override_ts": 0
 }
 
 
@@ -321,6 +357,128 @@ def summarize_closed_trades(events):
     }
 
 
+
+def consecutive_losses(events):
+    count = 0
+    for e in reversed(events):
+        result = clean(e.get("result")).upper()
+        pts_value = fval(e.get("points"), 0.0)
+        if result == "LOSS" or pts_value < 0:
+            count += 1
+            continue
+        break
+    return count
+
+
+def timeframe_minutes_from_data(data):
+    raw = clean(data.get("timeframe")) or clean(data.get("tf"))
+    if raw:
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if digits:
+            try:
+                x = int(digits)
+                if x > 0:
+                    return x
+            except Exception:
+                pass
+    return LOSS_GUARD_TIMEFRAME_MIN
+
+
+def is_quality_override_reason(reason):
+    if not LOSS_GUARD_ALLOW_QUALITY_OVERRIDE:
+        return False
+    r = clean(reason).upper()
+    if not r:
+        return False
+    return any(k in r for k in QUALITY_OVERRIDE_KEYWORDS)
+
+
+def loss_guard_active(state=None):
+    if not LOSS_GUARD_ENABLED:
+        return False
+    if state is None:
+        state = load_state()
+    until_ts = int(fval(state.get("loss_guard_until_ts"), 0))
+    return until_ts > now_ts()
+
+
+def loss_guard_status_text(state=None):
+    if state is None:
+        state = load_state()
+    until_ts = int(fval(state.get("loss_guard_until_ts"), 0))
+    if until_ts <= now_ts():
+        return "niet actief"
+    mins_left = max(0, int((until_ts - now_ts() + 59) / 60))
+    return f"actief tot {local_time_str(until_ts)} (nog ongeveer {mins_left} min)"
+
+
+def maybe_arm_loss_guard_after_sell(data=None):
+    if not LOSS_GUARD_ENABLED:
+        return None
+
+    day_start, day_end = day_bounds()
+    events = closed_trade_events(day_start, day_end)
+    day_sum = summarize_closed_trades(events)
+    loss_streak = consecutive_losses(events)
+
+    triggers = []
+    if LOSS_STREAK_LIMIT > 0 and loss_streak >= LOSS_STREAK_LIMIT:
+        triggers.append(f"{loss_streak} verliestrades achter elkaar")
+    if day_sum["gross_eur"] <= LOSS_GUARD_DAILY_LIMIT_EUR:
+        triggers.append(f"dagverlies {fmt_eur(day_sum['gross_eur'])} <= {fmt_eur(LOSS_GUARD_DAILY_LIMIT_EUR)}")
+
+    if not triggers:
+        return None
+
+    tf_min = timeframe_minutes_from_data(data or {})
+    cooldown_seconds = max(1, LOSS_GUARD_COOLDOWN_CANDLES) * max(1, tf_min) * 60
+    until_ts = now_ts() + cooldown_seconds
+
+    s = load_state()
+    current_until = int(fval(s.get("loss_guard_until_ts"), 0))
+    if until_ts <= current_until:
+        return {
+            "armed": False,
+            "reason": s.get("loss_guard_reason", ""),
+            "until_ts": current_until,
+            "loss_streak": loss_streak,
+            "day_gross_eur": day_sum["gross_eur"]
+        }
+
+    reason = "; ".join(triggers)
+    s["loss_guard_until_ts"] = until_ts
+    s["loss_guard_reason"] = reason
+    s["loss_guard_last_arm_ts"] = now_ts()
+    save_state(s)
+
+    return {
+        "armed": True,
+        "reason": reason,
+        "until_ts": until_ts,
+        "loss_streak": loss_streak,
+        "day_gross_eur": day_sum["gross_eur"]
+    }
+
+
+def buy_blocked_by_loss_guard(data, state=None):
+    if not LOSS_GUARD_ENABLED:
+        return (False, "")
+    if state is None:
+        state = load_state()
+    if not loss_guard_active(state):
+        return (False, "")
+
+    reason = clean(data.get("reason")) or clean(data.get("exit_reason"))
+    if is_quality_override_reason(reason):
+        state["loss_guard_last_override_ts"] = now_ts()
+        save_state(state)
+        return (False, f"Quality override toegestaan tijdens chopbescherming: {reason}")
+
+    state["loss_guard_last_block_ts"] = now_ts()
+    save_state(state)
+    until_ts = int(fval(state.get("loss_guard_until_ts"), 0))
+    return (True, f"Render chopbescherming actief na {state.get('loss_guard_reason')}. Normale BUY geblokkeerd tot {local_time_str(until_ts)}. Rocket/breakout/HH-HL/reclaim override blijft toegestaan.")
+
 def day_bounds(date_str=None):
     if date_str:
         y, m, d = [int(x) for x in date_str.split("-")]
@@ -353,7 +511,7 @@ def format_daily_summary(date_str=None):
     title_date = local_dt(start).strftime("%d-%m-%Y")
 
     lines = [
-        "ð RBT DAGOVERZICHT",
+        "RBT DAGOVERZICHT",
         "",
         f"Datum: {title_date}",
         f"Gesloten trades: {s['closed_trades']}",
@@ -397,7 +555,7 @@ def format_weekly_summary(date_str=None):
         day_lines.append(f"{day_name}: {pts(ds['points'])} punten ({ds['closed_trades']} trades)")
 
     lines = [
-        "ð RBT WEEKOVERZICHT",
+        "RBT WEEKOVERZICHT",
         "",
         f"Week vanaf: {local_dt(start).strftime('%d-%m-%Y')}",
         "",
@@ -569,11 +727,25 @@ def order_id(result):
 
 
 def get_volume(data, action):
+    # SELL: verkoop wat Pine vraagt/server toestaat. BUY: standaard gebruikt Render de afgesproken inzet,
+    # zodat oude Pine JSON met 0.00010 niet per ongeluk de inzet klein houdt.
     if action == "BTC_EXIT":
         keys = ["sell_amount_btc", "max_sell_btc", "amount_btc", "volume", "qty", "quantity"]
-    else:
-        keys = ["buy_amount_btc", "amount_btc", "volume", "qty", "quantity"]
+        for k in keys:
+            v = clean(data.get(k))
+            if v:
+                try:
+                    x = float(v)
+                    if x > 0:
+                        return f"{x:.8f}"
+                except Exception:
+                    pass
+        return DEFAULT_BTC_VOLUME
 
+    if not HONOR_TV_BUY_VOLUME:
+        return f"{float(DEFAULT_BTC_VOLUME):.8f}"
+
+    keys = ["buy_amount_btc", "amount_btc", "volume", "qty", "quantity"]
     for k in keys:
         v = clean(data.get(k))
         if v:
@@ -584,7 +756,7 @@ def get_volume(data, action):
             except Exception:
                 pass
 
-    return DEFAULT_BTC_VOLUME
+    return f"{float(DEFAULT_BTC_VOLUME):.8f}"
 
 
 def pine_trade_text(data, action, price):
@@ -772,7 +944,7 @@ def update_sell_state(volume, price, oid, data):
 
 
 def buy_message(bot, ticker, price, volume, oid, reason, state):
-    return f"""â KRAKEN BUY UITGEVOERD
+    return f"""KRAKEN BUY UITGEVOERD
 
 Bot: {bot}
 Ticker: {ticker}
@@ -812,7 +984,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
     week_sum = summarize_closed_trades(closed_trade_events(week_start, week_end))
 
     lines = [
-        "â KRAKEN SELL UITGEVOERD",
+        "KRAKEN SELL UITGEVOERD",
         "",
         f"Bot: {bot}",
         f"Ticker: {ticker}",
@@ -868,7 +1040,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot draait",
-        "version": "app.py V9.17 TELEGRAM EUR FIX",
+        "version": "app.py V9.19 AGREED STAKE CHOP GUARD",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -881,7 +1053,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.17 TELEGRAM EUR FIX",
+        "version": "app.py V9.19 AGREED STAKE CHOP GUARD",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -898,8 +1070,16 @@ def status():
             "BOT_STATE_FILE": STATE_FILE,
             "TRADE_LOG_FILE": TRADE_LOG_FILE,
             "APP_TZ": APP_TZ,
-            "ROUND_TRIP_COST_POINTS": ROUND_TRIP_COST_POINTS
+            "ROUND_TRIP_COST_POINTS": ROUND_TRIP_COST_POINTS,
+            "LOSS_GUARD_ENABLED": LOSS_GUARD_ENABLED,
+            "LOSS_STREAK_LIMIT": LOSS_STREAK_LIMIT,
+            "LOSS_GUARD_DAILY_LIMIT_EUR": LOSS_GUARD_DAILY_LIMIT_EUR,
+            "LOSS_GUARD_COOLDOWN_CANDLES": LOSS_GUARD_COOLDOWN_CANDLES,
+            "LOSS_GUARD_TIMEFRAME_MIN": LOSS_GUARD_TIMEFRAME_MIN,
+            "LOSS_GUARD_ALLOW_QUALITY_OVERRIDE": LOSS_GUARD_ALLOW_QUALITY_OVERRIDE,
+            "QUALITY_OVERRIDE_KEYWORDS": QUALITY_OVERRIDE_KEYWORDS
         },
+        "loss_guard_status": loss_guard_status_text(),
         "state": load_state()
     })
 
@@ -952,7 +1132,7 @@ def reset_state_route():
 
 @app.route("/send")
 def send_test():
-    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.17 EUR FIX")
+    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.19 AGREED STAKE CHOP GUARD")
     return jsonify({"ok": ok, "status": "test gestuurd"})
 
 
@@ -991,6 +1171,20 @@ def webhook():
         allow_add = bval(data.get("allow_add_buy"))
         if bot_pos >= MIN_BTC_VOLUME and not allow_add:
             send_telegram(blocked_message(data, f"BUY geblokkeerd: server heeft al botpositie {bot_pos:.8f} BTC en allow_add_buy=false."))
+            return "ok", 200
+
+        # Max botpositie bewaken op Render, onafhankelijk van Pine.
+        remaining_btc = round(MAX_BOT_POSITION_BTC - bot_pos, 8)
+        if remaining_btc < MIN_BTC_VOLUME:
+            send_telegram(blocked_message(data, f"BUY geblokkeerd: max botpositie bereikt. Botpositie: {bot_pos:.8f} BTC, max: {MAX_BOT_POSITION_BTC:.8f} BTC."))
+            return "ok", 200
+        if volume_float > remaining_btc:
+            volume_float = remaining_btc
+            volume = f"{volume_float:.8f}"
+
+        guard_blocked, guard_reason = buy_blocked_by_loss_guard(data, state)
+        if guard_blocked:
+            send_telegram(blocked_message(data, guard_reason))
             return "ok", 200
 
         res = kraken_buy(volume)
@@ -1097,6 +1291,8 @@ Kraken result:
                 "warning": new_state.get("last_pine_result_warning")
             })
 
+            guard_info = maybe_arm_loss_guard_after_sell(data)
+
             msg = sell_message(
                 bot=bot,
                 ticker=ticker,
@@ -1108,6 +1304,15 @@ Kraken result:
                 entry_before=entry_before,
                 pine_entry=get_pine_entry(data)
             )
+            if guard_info and guard_info.get("armed"):
+                msg += (
+                    "\n\nRender chopbescherming actief"
+                    f"\nReden: {guard_info.get('reason')}"
+                    f"\nCooldown: {LOSS_GUARD_COOLDOWN_CANDLES} candles"
+                    f"\nTot: {local_time_str(guard_info.get('until_ts'))}"
+                    "\nNormale BUY wordt tijdelijk geblokkeerd."
+                    "\nRocket/breakout/HH-HL/reclaim override blijft toegestaan."
+                )
         else:
             msg = base_message(data) + pine_trade_text(data, action, price) + f"""
 

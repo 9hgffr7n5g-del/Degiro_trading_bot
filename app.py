@@ -7,7 +7,7 @@ import base64
 import hashlib
 import urllib.parse
 import requests
-from threading import Lock
+from threading import Lock, Thread
 from datetime import datetime, timedelta, timezone
 try:
     from zoneinfo import ZoneInfo
@@ -72,6 +72,19 @@ TURBOBOT_MAX_TRADES_PER_DAY = int(os.environ.get("TURBOBOT_MAX_TRADES_PER_DAY", 
 TURBOBOT_COOLDOWN_AFTER_LOSS_SEC = int(os.environ.get("TURBOBOT_COOLDOWN_AFTER_LOSS_SEC", "300"))
 
 
+# AUTO DAILY TELEGRAM REPORTS - Render-side, Pine blijft leeg.
+# BTC/Kraken live dagoverzicht om 22:02 Europe/Amsterdam.
+# Turbobot/LEV paper dagoverzicht om 22:15 Europe/Amsterdam.
+AUTO_DAILY_REPORTS_ENABLED = env_bval(os.environ.get("AUTO_DAILY_REPORTS_ENABLED", "true"))
+BTC_DAILY_REPORT_HOUR = int(os.environ.get("BTC_DAILY_REPORT_HOUR", "22"))
+BTC_DAILY_REPORT_MINUTE = int(os.environ.get("BTC_DAILY_REPORT_MINUTE", "2"))
+TURBOBOT_DAILY_REPORT_HOUR = int(os.environ.get("TURBOBOT_DAILY_REPORT_HOUR", "22"))
+TURBOBOT_DAILY_REPORT_MINUTE = int(os.environ.get("TURBOBOT_DAILY_REPORT_MINUTE", "15"))
+AUTO_DAILY_REPORT_CHECK_SEC = int(os.environ.get("AUTO_DAILY_REPORT_CHECK_SEC", "20"))
+AUTO_DAILY_REPORT_WINDOW_MIN = int(os.environ.get("AUTO_DAILY_REPORT_WINDOW_MIN", "3"))
+AUTO_SUMMARY_STATE_FILE = os.environ.get("AUTO_SUMMARY_STATE_FILE", "/data/auto_summary_state.json" if os.path.isdir("/data") else "auto_summary_state.json")
+
+
 # Render-side chop/loss guard. Pine is already close to TradingView limits,
 # so this safety layer blocks only normal BUY signals after a bad streak/day loss.
 LOSS_GUARD_ENABLED = env_bval(os.environ.get("LOSS_GUARD_ENABLED", "true"))
@@ -93,6 +106,7 @@ STATE_LOCK = Lock()
 TRADE_LOCK = Lock()
 TURBOBOT_LOCK = Lock()
 TURBOBOT_LOG_LOCK = Lock()
+AUTO_SUMMARY_LOCK = Lock()
 
 DEFAULT_STATE = {
     "bot_position_btc": 0.0,
@@ -1593,7 +1607,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot + Turbobot Paper Engine draait",
-        "version": "app.py V9.24 COMBINED TURBOBOT PARSE FIX BTC 0.004 COMPACT TELEGRAM",
+        "version": "app.py V9.25 COMBINED AUTO DAILY REPORTS BTC 22:02 TURBO 22:15",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -1609,7 +1623,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.24 COMBINED TURBOBOT PARSE FIX BTC 0.004 COMPACT TELEGRAM",
+        "version": "app.py V9.25 COMBINED AUTO DAILY REPORTS BTC 22:02 TURBO 22:15",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -1642,7 +1656,11 @@ def status():
             "TURBOBOT_DAILY_TARGET_PCT": TURBOBOT_DAILY_TARGET_PCT,
             "TURBOBOT_DAILY_STOP_PCT": TURBOBOT_DAILY_STOP_PCT,
             "TURBOBOT_MAX_TRADES_PER_DAY": TURBOBOT_MAX_TRADES_PER_DAY,
-            "TURBOBOT_COOLDOWN_AFTER_LOSS_SEC": TURBOBOT_COOLDOWN_AFTER_LOSS_SEC
+            "TURBOBOT_COOLDOWN_AFTER_LOSS_SEC": TURBOBOT_COOLDOWN_AFTER_LOSS_SEC,
+            "AUTO_DAILY_REPORTS_ENABLED": AUTO_DAILY_REPORTS_ENABLED,
+            "BTC_DAILY_REPORT_TIME": f"{BTC_DAILY_REPORT_HOUR:02d}:{BTC_DAILY_REPORT_MINUTE:02d}",
+            "TURBOBOT_DAILY_REPORT_TIME": f"{TURBOBOT_DAILY_REPORT_HOUR:02d}:{TURBOBOT_DAILY_REPORT_MINUTE:02d}",
+            "AUTO_SUMMARY_STATE_FILE": AUTO_SUMMARY_STATE_FILE
         },
         "loss_guard_status": loss_guard_status_text(),
         "state": load_state(),
@@ -1661,6 +1679,138 @@ def trades_route():
     })
 
 
+
+def load_auto_summary_state():
+    try:
+        if not os.path.exists(AUTO_SUMMARY_STATE_FILE):
+            return {}
+        with open(AUTO_SUMMARY_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_auto_summary_state(state):
+    try:
+        ensure_parent(AUTO_SUMMARY_STATE_FILE)
+        with open(AUTO_SUMMARY_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def auto_summary_key(kind, date_str):
+    return f"{kind}:{date_str}"
+
+
+def auto_summary_already_sent(kind, date_str):
+    state = load_auto_summary_state()
+    return bool(state.get(auto_summary_key(kind, date_str)))
+
+
+def mark_auto_summary_sent(kind, date_str):
+    state = load_auto_summary_state()
+    state[auto_summary_key(kind, date_str)] = local_time_str()
+    state["last_sent_kind"] = kind
+    state["last_sent_date"] = date_str
+    state["last_sent_ts"] = now_ts()
+    save_auto_summary_state(state)
+
+
+def send_auto_daily_summary(kind, date_str=None, force=False):
+    date_str = date_str or local_date_str()
+    with AUTO_SUMMARY_LOCK:
+        if not force and auto_summary_already_sent(kind, date_str):
+            return False, f"{kind} dagoverzicht voor {date_str} was al verstuurd"
+
+        if kind == "btc":
+            msg = format_daily_summary(date_str)
+        elif kind == "turbobot":
+            msg = format_turbobot_daily_summary(date_str)
+        elif kind == "both":
+            btc_msg = format_daily_summary(date_str)
+            turbo_msg = format_turbobot_daily_summary(date_str)
+            ok1 = send_telegram(btc_msg)
+            ok2 = send_telegram(turbo_msg)
+            if ok1:
+                mark_auto_summary_sent("btc", date_str)
+            if ok2:
+                mark_auto_summary_sent("turbobot", date_str)
+            return bool(ok1 and ok2), "BTC en Turbobot dagoverzicht verstuurd"
+        else:
+            return False, f"Onbekend dagoverzicht type: {kind}"
+
+        ok = send_telegram(msg)
+        if ok:
+            mark_auto_summary_sent(kind, date_str)
+        return bool(ok), msg
+
+
+def in_report_window(now_dt, hour, minute):
+    scheduled = now_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    delta_sec = (now_dt - scheduled).total_seconds()
+    return 0 <= delta_sec < AUTO_DAILY_REPORT_WINDOW_MIN * 60
+
+
+def auto_daily_report_loop():
+    while True:
+        try:
+            if AUTO_DAILY_REPORTS_ENABLED:
+                now = local_dt()
+                date_str = now.strftime("%Y-%m-%d")
+                if in_report_window(now, BTC_DAILY_REPORT_HOUR, BTC_DAILY_REPORT_MINUTE):
+                    send_auto_daily_summary("btc", date_str=date_str, force=False)
+                if in_report_window(now, TURBOBOT_DAILY_REPORT_HOUR, TURBOBOT_DAILY_REPORT_MINUTE):
+                    send_auto_daily_summary("turbobot", date_str=date_str, force=False)
+        except Exception as exc:
+            try:
+                print("auto_daily_report_loop error", repr(exc), flush=True)
+            except Exception:
+                pass
+        time.sleep(max(10, AUTO_DAILY_REPORT_CHECK_SEC))
+
+
+def start_auto_daily_report_thread():
+    if not AUTO_DAILY_REPORTS_ENABLED:
+        return
+    # Voorkom dubbele scheduler bij Flask debug reloader.
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "false":
+        return
+    try:
+        t = Thread(target=auto_daily_report_loop, daemon=True)
+        t.start()
+    except Exception as exc:
+        try:
+            print("start_auto_daily_report_thread error", repr(exc), flush=True)
+        except Exception:
+            pass
+
+
+@app.route("/auto_summary_status")
+def auto_summary_status_route():
+    return jsonify({
+        "enabled": AUTO_DAILY_REPORTS_ENABLED,
+        "timezone": APP_TZ,
+        "btc_daily_report_time": f"{BTC_DAILY_REPORT_HOUR:02d}:{BTC_DAILY_REPORT_MINUTE:02d}",
+        "turbobot_daily_report_time": f"{TURBOBOT_DAILY_REPORT_HOUR:02d}:{TURBOBOT_DAILY_REPORT_MINUTE:02d}",
+        "state_file": AUTO_SUMMARY_STATE_FILE,
+        "state": load_auto_summary_state(),
+    })
+
+
+@app.route("/send_all_daily_summaries", methods=["GET", "POST"])
+def send_all_daily_summaries_route():
+    date_str = request.args.get("date") or local_date_str()
+    force = bval(request.args.get("force", "false"))
+    if force:
+        ok1, msg1 = send_auto_daily_summary("btc", date_str=date_str, force=True)
+        ok2, msg2 = send_auto_daily_summary("turbobot", date_str=date_str, force=True)
+        return jsonify({"ok": bool(ok1 and ok2), "btc": ok1, "turbobot": ok2, "date": date_str})
+    ok, msg = send_auto_daily_summary("both", date_str=date_str, force=False)
+    return jsonify({"ok": ok, "message": msg, "date": date_str})
+
+
 @app.route("/daily_summary")
 def daily_summary_route():
     date_str = request.args.get("date")
@@ -1675,9 +1825,11 @@ def weekly_summary_route():
 
 @app.route("/send_daily_summary", methods=["GET", "POST"])
 def send_daily_summary_route():
-    date_str = request.args.get("date")
+    date_str = request.args.get("date") or local_date_str()
     msg = format_daily_summary(date_str)
     ok = send_telegram(msg)
+    if ok:
+        mark_auto_summary_sent("btc", date_str)
     return jsonify({"ok": ok, "message": msg})
 
 
@@ -1721,9 +1873,11 @@ def turbobot_daily_summary_route():
 
 @app.route("/send_turbobot_daily_summary", methods=["GET", "POST"])
 def send_turbobot_daily_summary_route():
-    date_str = request.args.get("date")
+    date_str = request.args.get("date") or local_date_str()
     msg = format_turbobot_daily_summary(date_str)
     ok = send_telegram(msg)
+    if ok:
+        mark_auto_summary_sent("turbobot", date_str)
     return jsonify({"ok": ok, "message": msg})
 
 
@@ -1945,6 +2099,8 @@ Kraken result:
     send_telegram(blocked_message(data, f"Onbekende actie: {action}"))
     return "ok", 200
 
+
+start_auto_daily_report_thread()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

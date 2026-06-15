@@ -995,20 +995,26 @@ def tb_format_message(kind, signal, state, price, data, extra_lines=None):
     symbol = tb_symbol_from_data(data) or clean(state.get("symbol"))
     tf = tb_timeframe_from_data(data) or clean(state.get("timeframe"))
     reason = tb_reason_from_data(data)
+    pos = clean(state.get("position")).upper() or "FLAT"
+    open_eur, open_pct = tb_open_pnl(state, price)
+
     lines = [
         f"TURBOBOT {signal}",
-        "",
-        f"Ticker: {symbol}",
-        f"Timeframe: {tf}",
+        f"Ticker: {symbol} {tf}",
         f"Prijs: {fmt(price, 3)}",
-        "Mode: PAPER / SIGNAL ONLY",
-        f"Hefboom sim: {TURBOBOT_LEVERAGE:.1f}x",
+        f"Positie: {pos}",
+        f"Paper: EUR {TURBOBOT_START_CAPITAL:.0f} | inzet {TURBOBOT_TRADE_FRACTION * 100:.0f}% | hefboom {TURBOBOT_LEVERAGE:.1f}x",
+        f"Dag P/L: {fmt_eur(fval(state.get('daily_realized_eur'), 0.0))} ({fval(state.get('daily_realized_pct'), 0.0):+.2f}%)",
+        f"Trades: {int(state.get('daily_closed_trades') or 0)} | W/L/F {int(state.get('daily_wins') or 0)}/{int(state.get('daily_losses') or 0)}/{int(state.get('daily_flats') or 0)}",
     ]
+    if pos in ["LONG", "SHORT"]:
+        lines.append(f"Open P/L: {fmt_eur(open_eur)} ({open_pct:+.2f}%)")
     if reason:
         lines.append(f"Reden: {reason}")
     if extra_lines:
-        lines += ["", *extra_lines]
-    lines += ["", *tb_status_lines(state, price), "", f"Tijd: {local_time_str()}"]
+        # Houd alleen de nuttige extra regels; geen lange debugdump in normale Telegram.
+        lines += [line for line in extra_lines if clean(line)]
+    lines.append(f"Tijd: {local_time_str()}")
     return "\n".join(lines)
 
 
@@ -1391,7 +1397,6 @@ def get_pine_entry(data):
 
 def base_message(data):
     return f"""Trading Alert
-
 Bot: {clean(data.get("bot"))}
 Ticker: {clean(data.get("ticker"))}
 Actie: {clean(data.get("action"))}
@@ -1401,49 +1406,10 @@ Timeframe: {clean(data.get("timeframe")) or clean(data.get("tf"))}
 
 
 def blocked_message(data, reason):
-    s = load_state()
     return base_message(data) + pine_trade_text(data, clean(data.get("action")), clean(data.get("price"))) + f"""
-
 LET OP - Kraken-order NIET uitgevoerd
-
-Reden:
-{reason}
-
-Diagnose:
-trade_mode_json: {clean(data.get("trade_mode"))}
-mode_json: {clean(data.get("mode"))}
-live_json: {clean(data.get("live"))}
-execute_json: {clean(data.get("execute"))}
-place_order_json: {clean(data.get("place_order"))}
-kraken_order_json: {clean(data.get("kraken_order"))}
-telegram_only_json: {clean(data.get("telegram_only"))}
-dry_run_json: {clean(data.get("dry_run"))}
-paper_json: {clean(data.get("paper"))}
-allow_add_buy_json: {clean(data.get("allow_add_buy"))}
-
-Render env:
-TRADE_MODE={TRADE_MODE_ENV}
-BOT_MODE={BOT_MODE_ENV}
-EXECUTE_ORDERS={EXECUTE_ORDERS_ENV}
-LIVE_TRADING={LIVE_TRADING_ENV}
-DRY_RUN={DRY_RUN_ENV}
-PAPER_TRADING={PAPER_TRADING_ENV}
-TELEGRAM_ONLY={TELEGRAM_ONLY_ENV}
-EXCHANGE={EXCHANGE_ENV}
-MARKET={MARKET_ENV}
-KRAKEN_API_KEY_SET={bool(KRAKEN_API_KEY)}
-KRAKEN_API_SECRET_SET={bool(KRAKEN_API_SECRET)}
-
-Server bot-state:
-bot_position_btc={s.get("bot_position_btc")}
-avg_entry_price={s.get("avg_entry_price")}
-last_buy_price={s.get("last_buy_price")}
-last_buy_volume={s.get("last_buy_volume")}
-last_buy_order_id={s.get("last_buy_order_id")}
-last_sell_price={s.get("last_sell_price")}
-last_trade_points={s.get("last_trade_points")}
-last_trade_result={s.get("last_trade_result")}
-open_trade_id={s.get("open_trade_id")}
+Reden: {reason}
+Tijd: {local_time_str()}
 """
 
 
@@ -1544,20 +1510,16 @@ def buy_message(bot, ticker, price, volume, oid, reason, state):
     position_value = position_btc * avg_entry if avg_entry is not None else None
 
     return f"""KRAKEN BUY UITGEVOERD
-
 Bot: {bot}
 Ticker: {ticker}
-Koers aankoop: {fmt(price_f, 1)}
+Koers: {fmt(price_f, 1)}
 Aantal BTC: {volume_f:.8f}
-Waarde aankoop: {fmt_eur_abs(order_value, 2)}
-Order-ID: {oid}
+Waarde: {fmt_eur_abs(order_value, 2)}
 Reden: {reason}
 
-Serverpositie:
-BTC: {position_btc:.8f}
-Gemiddelde instap: {fmt(avg_entry, 1)}
-Positiewaarde bij instap: {fmt_eur_abs(position_value, 2)}
-Laatste koopprijs: {fmt(state.get("last_buy_price"), 1)}
+Botpositie: {position_btc:.8f} BTC
+Gem. instap: {fmt(avg_entry, 1)}
+Positiewaarde: {fmt_eur_abs(position_value, 2)}
 Tijd: {local_time_str()}
 """
 
@@ -1580,62 +1542,47 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
         result = result_from_points(points)
 
     day_start, day_end = day_bounds()
-    week_start, week_end = week_bounds()
     day_sum = summarize_closed_trades(closed_trade_events(day_start, day_end))
-    week_sum = summarize_closed_trades(closed_trade_events(week_start, week_end))
 
     lines = [
         "KRAKEN SELL UITGEVOERD",
-        "",
         f"Bot: {bot}",
         f"Ticker: {ticker}",
-        f"Koers verkoop: {fmt(price, 1)}",
+        f"Koers verkoop: {fmt(exitp, 1)}",
         f"Aantal BTC: {vol:.8f}",
         f"Verkoopwaarde: {fmt_eur_abs(exitp * vol if exitp is not None else None, 2)}",
-        f"Order-ID: {oid}",
         f"Reden: {reason}",
         "",
-        "Trade-resultaat:",
-        f"Koers aankoop: {fmt(entry, 1)}",
-        f"Koers verkoop: {fmt(exitp, 1)}",
-        f"Aankoopwaarde: {fmt_eur_abs(entry * vol if entry is not None else None, 2)}",
-        f"Verkoopwaarde: {fmt_eur_abs(exitp * vol if exitp is not None else None, 2)}",
-        f"Punten bruto: {pts(points)}",
-        f"Resultaat EUR bruto: {fmt_eur(gross_eur)}",
-        f"Resultaat EUR netto: {fmt_eur(net_eur)}",
+        f"Instap: {fmt(entry, 1)}",
+        f"Exit: {fmt(exitp, 1)}",
+        f"Punten: {pts(points)}",
+        f"Resultaat bruto: {fmt_eur(gross_eur)}",
+        f"Geschat netto: {fmt_eur(net_eur)}",
         f"Resultaat: {nl_result(result)}",
     ]
 
     pine = fval(pine_entry, None)
     if pine is not None and entry is not None:
         diff = pine - entry
-        lines += [
-            "",
-            "Controle Pine vs server:",
-            f"Pine instap: {fmt(pine, 1)}",
-            f"Server instap: {fmt(entry, 1)}",
-            f"Verschil: {pts(diff)} punten",
-        ]
         if abs(diff) >= 1.0:
-            lines.append("LET OP: server/Kraken-resultaat is leidend.")
+            lines += [
+                "",
+                "Controle:",
+                f"Pine instap: {fmt(pine, 1)}",
+                f"Server instap: {fmt(entry, 1)}",
+                f"Verschil: {pts(diff)} punten",
+                "LET OP: server/Kraken-resultaat is leidend.",
+            ]
 
     lines += [
         "",
         "Dag totaal:",
-        f"Punten bruto: {pts(day_sum['points'])}",
-        f"Resultaat EUR bruto: {fmt_eur(day_sum['gross_eur'])}",
+        f"Punten: {pts(day_sum['points'])}",
+        f"Bruto EUR: {fmt_eur(day_sum['gross_eur'])}",
         f"Geschat netto: {fmt_eur(day_sum['net_eur_est'])}",
         f"Gesloten trades: {day_sum['closed_trades']}",
         "",
-        "Week totaal:",
-        f"Punten bruto: {pts(week_sum['points'])}",
-        f"Resultaat EUR bruto: {fmt_eur(week_sum['gross_eur'])}",
-        f"Geschat netto: {fmt_eur(week_sum['net_eur_est'])}",
-        f"Gesloten trades: {week_sum['closed_trades']}",
-        "",
-        "Serverpositie na SELL:",
-        f"BTC: {fval(state.get('bot_position_btc'), 0.0):.8f}",
-        f"Gesloten trades totaal: {state.get('closed_trades')}",
+        f"Serverpositie: {fval(state.get('bot_position_btc'), 0.0):.8f} BTC",
         f"Tijd: {local_time_str()}",
     ]
 
@@ -1646,7 +1593,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot + Turbobot Paper Engine draait",
-        "version": "app.py V9.23 COMBINED TURBOBOT PARSE FIX BTC 0.004",
+        "version": "app.py V9.24 COMBINED TURBOBOT PARSE FIX BTC 0.004 COMPACT TELEGRAM",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -1662,7 +1609,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.23 COMBINED TURBOBOT PARSE FIX BTC 0.004",
+        "version": "app.py V9.24 COMBINED TURBOBOT PARSE FIX BTC 0.004 COMPACT TELEGRAM",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,

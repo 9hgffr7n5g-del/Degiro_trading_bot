@@ -68,6 +68,11 @@ TURBOBOT_TRADE_FRACTION = float(os.environ.get("TURBOBOT_TRADE_FRACTION", "0.25"
 TURBOBOT_LEVERAGE = float(os.environ.get("TURBOBOT_LEVERAGE", "4"))
 TURBOBOT_DAILY_TARGET_PCT = float(os.environ.get("TURBOBOT_DAILY_TARGET_PCT", "1.0"))
 TURBOBOT_DAILY_STOP_PCT = float(os.environ.get("TURBOBOT_DAILY_STOP_PCT", "-1.0"))
+# V9.26: dagtarget is geen harde winst-max meer.
+# Target hit blijft zichtbaar in rapport/status, maar Turbobot mag door in runner/profit-protect mode.
+# Alleen dagstop/kill switch/cooldown/max trades kunnen nog echt blokkeren.
+TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES = env_bval(os.environ.get("TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES", "false"))
+TURBOBOT_RUNNER_MODE_AFTER_TARGET = env_bval(os.environ.get("TURBOBOT_RUNNER_MODE_AFTER_TARGET", "true"))
 TURBOBOT_MAX_TRADES_PER_DAY = int(os.environ.get("TURBOBOT_MAX_TRADES_PER_DAY", "12"))
 TURBOBOT_COOLDOWN_AFTER_LOSS_SEC = int(os.environ.get("TURBOBOT_COOLDOWN_AFTER_LOSS_SEC", "300"))
 
@@ -897,7 +902,7 @@ def tb_can_open_new_trade(state):
         return False, "Kill switch staat aan."
     if bval(state.get("daily_stop_hit")):
         return False, "Dagstop geraakt. Geen nieuwe Turbobot paper-trades."
-    if bval(state.get("daily_target_hit")):
+    if bval(state.get("daily_target_hit")) and TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES:
         return False, "Dagtarget geraakt. Nieuwe trades worden geblokkeerd."
     if int(state.get("daily_closed_trades") or 0) >= TURBOBOT_MAX_TRADES_PER_DAY:
         return False, f"Max trades per dag bereikt ({TURBOBOT_MAX_TRADES_PER_DAY})."
@@ -1000,6 +1005,7 @@ def tb_status_lines(state, price=None):
         f"Open P/L: {fmt_eur(open_eur)} ({fmt_pct(open_pct)})",
         f"Dag P/L: {fmt_eur(state.get('daily_realized_eur'))} ({fmt_pct(state.get('daily_realized_pct'))})",
         f"Dagtarget {TURBOBOT_DAILY_TARGET_PCT:.1f}%: {'JA' if bval(state.get('daily_target_hit')) else 'nee'}",
+        f"Runner mode: {'AAN' if (bval(state.get('daily_target_hit')) and TURBOBOT_RUNNER_MODE_AFTER_TARGET and not TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES) else 'nee'}",
         f"Dagstop {TURBOBOT_DAILY_STOP_PCT:.1f}%: {'JA' if bval(state.get('daily_stop_hit')) else 'nee'}",
         f"Trades vandaag: {int(state.get('daily_closed_trades') or 0)} / {TURBOBOT_MAX_TRADES_PER_DAY}",
     ]
@@ -1019,6 +1025,7 @@ def tb_format_message(kind, signal, state, price, data, extra_lines=None):
         f"Positie: {pos}",
         f"Paper: EUR {TURBOBOT_START_CAPITAL:.0f} | inzet {TURBOBOT_TRADE_FRACTION * 100:.0f}% | hefboom {TURBOBOT_LEVERAGE:.1f}x",
         f"Dag P/L: {fmt_eur(fval(state.get('daily_realized_eur'), 0.0))} ({fval(state.get('daily_realized_pct'), 0.0):+.2f}%)",
+        f"Runner mode: {'AAN' if (bval(state.get('daily_target_hit')) and TURBOBOT_RUNNER_MODE_AFTER_TARGET and not TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES) else 'nee'}",
         f"Trades: {int(state.get('daily_closed_trades') or 0)} | W/L/F {int(state.get('daily_wins') or 0)}/{int(state.get('daily_losses') or 0)}/{int(state.get('daily_flats') or 0)}",
     ]
     if pos in ["LONG", "SHORT"]:
@@ -1189,6 +1196,8 @@ def format_turbobot_daily_summary(date_str=None):
         "",
         f"Dag P/L: {fmt_eur(pnl_eur)} ({fmt_pct(pnl_pct)})",
         f"Dagtarget {TURBOBOT_DAILY_TARGET_PCT:.1f}%: {'JA' if pnl_pct >= TURBOBOT_DAILY_TARGET_PCT else 'nee'}",
+        f"Runner mode na target: {'AAN' if (pnl_pct >= TURBOBOT_DAILY_TARGET_PCT and TURBOBOT_RUNNER_MODE_AFTER_TARGET and not TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES) else 'nee'}",
+        f"Dagtarget blokkeert nieuwe trades: {'JA' if TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES else 'nee'}",
         f"Dagstop {TURBOBOT_DAILY_STOP_PCT:.1f}%: {'JA' if pnl_pct <= TURBOBOT_DAILY_STOP_PCT else 'nee'}",
     ]
     if best:
@@ -1607,7 +1616,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot + Turbobot Paper Engine draait",
-        "version": "app.py V9.25 COMBINED AUTO DAILY REPORTS BTC 22:02 TURBO 22:15",
+        "version": "app.py V9.26 COMBINED TURBOBOT RUNNER MODE NO DAILY TARGET BLOCK",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -1623,7 +1632,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.25 COMBINED AUTO DAILY REPORTS BTC 22:02 TURBO 22:15",
+        "version": "app.py V9.26 COMBINED TURBOBOT RUNNER MODE NO DAILY TARGET BLOCK",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,

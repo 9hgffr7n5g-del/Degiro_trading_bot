@@ -75,6 +75,12 @@ TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES = env_bval(os.environ.get("TURBOBOT_DAIL
 TURBOBOT_RUNNER_MODE_AFTER_TARGET = env_bval(os.environ.get("TURBOBOT_RUNNER_MODE_AFTER_TARGET", "true"))
 TURBOBOT_MAX_TRADES_PER_DAY = int(os.environ.get("TURBOBOT_MAX_TRADES_PER_DAY", "12"))
 TURBOBOT_COOLDOWN_AFTER_LOSS_SEC = int(os.environ.get("TURBOBOT_COOLDOWN_AFTER_LOSS_SEC", "300"))
+# V9.27: Telegram schoonhouden. Pine mag blijven sturen; Render negeert ruis stil.
+TURBOBOT_SILENCE_AFTER_DAILY_STOP = env_bval(os.environ.get("TURBOBOT_SILENCE_AFTER_DAILY_STOP", "true"))
+TURBOBOT_SILENCE_IGNORED_FLAT_EXITS = env_bval(os.environ.get("TURBOBOT_SILENCE_IGNORED_FLAT_EXITS", "true"))
+TURBOBOT_SILENCE_BAD_LOCKS = env_bval(os.environ.get("TURBOBOT_SILENCE_BAD_LOCKS", "true"))
+TURBOBOT_LOCK_REQUIRES_PROFIT = env_bval(os.environ.get("TURBOBOT_LOCK_REQUIRES_PROFIT", "true"))
+TURBOBOT_LOCK_MIN_OPEN_PCT = float(os.environ.get("TURBOBOT_LOCK_MIN_OPEN_PCT", "0.0"))
 
 
 # AUTO DAILY TELEGRAM REPORTS - Render-side, Pine blijft leeg.
@@ -1052,22 +1058,64 @@ def handle_turbobot_alert(data):
     state["last_signal"] = signal
     state["last_price"] = price
     pos = clean(state.get("position")).upper() or "FLAT"
+
+    # V9.27: na dagstop geen Telegram-spam meer voor nieuwe entries/locks/loze exits.
+    # Dit verandert niets aan Pine of dagrapport; het houdt alleen Render schoon.
+    if bval(state.get("daily_stop_hit")) and TURBOBOT_SILENCE_AFTER_DAILY_STOP:
+        if pos == "FLAT" and signal in ["LONG", "SHORT", "LOCK_LONG", "LOCK_SHORT", "SELL_LONG", "BUY_SHORT"]:
+            tb_append_event({"type": "SILENT_AFTER_DAYSTOP", "signal": signal, "price": price, "position": pos, "raw": data})
+            tb_save_state(state)
+            return {"ok": True, "signal": signal, "silent": True, "reason": "daily_stop_flat", "state": state}
+
     response_kind = "INFO"
     response_signal = signal
     extra = []
 
-    if signal == "LOCK_LONG" and pos == "LONG":
-        state["daily_locks"] = int(state.get("daily_locks") or 0) + 1
-        open_eur, open_pct = tb_open_pnl(state, price)
-        tb_append_event({"type": "LOCK", "side": "LONG", "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "raw": data})
-        response_kind = "LOCK"
-        extra = ["LOCK signaal: winst beschermen / trailing aanscherpen. Geen volledige paper-close."]
-    elif signal == "LOCK_SHORT" and pos == "SHORT":
-        state["daily_locks"] = int(state.get("daily_locks") or 0) + 1
-        open_eur, open_pct = tb_open_pnl(state, price)
-        tb_append_event({"type": "LOCK", "side": "SHORT", "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "raw": data})
-        response_kind = "LOCK"
-        extra = ["LOCK signaal: winst beschermen / trailing aanscherpen. Geen volledige paper-close."]
+    # V9.27: LOCK is alleen winstbescherming/handrem. Geen lock bij verlies en geen onbekend-signaal spam.
+    if signal == "LOCK_LONG":
+        if pos == "LONG":
+            open_eur, open_pct = tb_open_pnl(state, price)
+            if (not TURBOBOT_LOCK_REQUIRES_PROFIT) or open_pct > TURBOBOT_LOCK_MIN_OPEN_PCT:
+                state["daily_locks"] = int(state.get("daily_locks") or 0) + 1
+                tb_append_event({"type": "LOCK", "side": "LONG", "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "raw": data})
+                response_kind = "LOCK"
+                extra = ["LOCK_LONG bevestigd: winst beschermen / trailing aanscherpen. Geen paper-close."]
+            else:
+                tb_append_event({"type": "LOCK_IGNORED", "side": "LONG", "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "reason": "no_profit", "raw": data})
+                tb_save_state(state)
+                if TURBOBOT_SILENCE_BAD_LOCKS:
+                    return {"ok": True, "signal": signal, "silent": True, "reason": "lock_without_profit", "state": state}
+                response_kind = "INFO"
+                extra = [f"LOCK_LONG genegeerd: open P/L is {fmt_pct(open_pct)}."]
+        else:
+            tb_append_event({"type": "LOCK_IGNORED", "side": "LONG", "price": price, "position": pos, "reason": "wrong_position", "raw": data})
+            tb_save_state(state)
+            if TURBOBOT_SILENCE_BAD_LOCKS:
+                return {"ok": True, "signal": signal, "silent": True, "reason": "lock_wrong_position", "state": state}
+            response_kind = "INFO"
+            extra = [f"LOCK_LONG genegeerd: huidige positie is {pos}."]
+    elif signal == "LOCK_SHORT":
+        if pos == "SHORT":
+            open_eur, open_pct = tb_open_pnl(state, price)
+            if (not TURBOBOT_LOCK_REQUIRES_PROFIT) or open_pct > TURBOBOT_LOCK_MIN_OPEN_PCT:
+                state["daily_locks"] = int(state.get("daily_locks") or 0) + 1
+                tb_append_event({"type": "LOCK", "side": "SHORT", "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "raw": data})
+                response_kind = "LOCK"
+                extra = ["LOCK_SHORT bevestigd: winst beschermen / trailing aanscherpen. Geen paper-close."]
+            else:
+                tb_append_event({"type": "LOCK_IGNORED", "side": "SHORT", "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "reason": "no_profit", "raw": data})
+                tb_save_state(state)
+                if TURBOBOT_SILENCE_BAD_LOCKS:
+                    return {"ok": True, "signal": signal, "silent": True, "reason": "lock_without_profit", "state": state}
+                response_kind = "INFO"
+                extra = [f"LOCK_SHORT genegeerd: open P/L is {fmt_pct(open_pct)}."]
+        else:
+            tb_append_event({"type": "LOCK_IGNORED", "side": "SHORT", "price": price, "position": pos, "reason": "wrong_position", "raw": data})
+            tb_save_state(state)
+            if TURBOBOT_SILENCE_BAD_LOCKS:
+                return {"ok": True, "signal": signal, "silent": True, "reason": "lock_wrong_position", "state": state}
+            response_kind = "INFO"
+            extra = [f"LOCK_SHORT genegeerd: huidige positie is {pos}."]
     elif signal == "LONG":
         if pos == "LONG":
             response_kind = "INFO"
@@ -1091,6 +1139,10 @@ def handle_turbobot_alert(data):
                 response_kind = "LONG"
                 extra = ["Nieuwe paper LONG geopend."]
             else:
+                tb_append_event({"type": "OPEN_BLOCKED", "side": "LONG", "price": price, "reason": why, "raw": data})
+                tb_save_state(state)
+                if bval(state.get("daily_stop_hit")) and TURBOBOT_SILENCE_AFTER_DAILY_STOP:
+                    return {"ok": True, "signal": signal, "silent": True, "reason": "daily_stop", "state": state}
                 response_kind = "BLOCK"
                 extra = [f"LONG geblokkeerd: {why}"]
     elif signal == "SHORT":
@@ -1116,6 +1168,10 @@ def handle_turbobot_alert(data):
                 response_kind = "SHORT"
                 extra = ["Nieuwe paper SHORT geopend."]
             else:
+                tb_append_event({"type": "OPEN_BLOCKED", "side": "SHORT", "price": price, "reason": why, "raw": data})
+                tb_save_state(state)
+                if bval(state.get("daily_stop_hit")) and TURBOBOT_SILENCE_AFTER_DAILY_STOP:
+                    return {"ok": True, "signal": signal, "silent": True, "reason": "daily_stop", "state": state}
                 response_kind = "BLOCK"
                 extra = [f"SHORT geblokkeerd: {why}"]
     elif signal == "SELL_LONG":
@@ -1125,6 +1181,10 @@ def handle_turbobot_alert(data):
             response_signal = "SELL LONG"
             extra = [f"LONG gesloten: {fmt_eur(closed.get('pnl_eur'))} ({fmt_pct(closed.get('pnl_pct'))})"]
         else:
+            tb_append_event({"type": "EXIT_IGNORED", "signal": signal, "price": price, "position": pos, "raw": data})
+            tb_save_state(state)
+            if TURBOBOT_SILENCE_IGNORED_FLAT_EXITS:
+                return {"ok": True, "signal": signal, "silent": True, "reason": "flat_exit_ignored", "state": state}
             response_kind = "INFO"
             extra = [f"SELL_LONG genegeerd: huidige positie is {pos}."]
     elif signal == "BUY_SHORT":
@@ -1134,6 +1194,10 @@ def handle_turbobot_alert(data):
             response_signal = "BUY SHORT"
             extra = [f"SHORT gesloten: {fmt_eur(closed.get('pnl_eur'))} ({fmt_pct(closed.get('pnl_pct'))})"]
         else:
+            tb_append_event({"type": "EXIT_IGNORED", "signal": signal, "price": price, "position": pos, "raw": data})
+            tb_save_state(state)
+            if TURBOBOT_SILENCE_IGNORED_FLAT_EXITS:
+                return {"ok": True, "signal": signal, "silent": True, "reason": "flat_exit_ignored", "state": state}
             response_kind = "INFO"
             extra = [f"BUY_SHORT genegeerd: huidige positie is {pos}."]
     else:
@@ -1145,7 +1209,6 @@ def handle_turbobot_alert(data):
     msg = tb_format_message(response_kind, response_signal, state, price, data, extra)
     send_telegram(msg)
     return {"ok": True, "signal": signal, "state": state, "message": msg}
-
 
 def tb_events_in_period(start_ts=None, end_ts=None):
     out = []
@@ -1616,7 +1679,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot + Turbobot Paper Engine draait",
-        "version": "app.py V9.26 COMBINED TURBOBOT RUNNER MODE NO DAILY TARGET BLOCK",
+        "version": "app.py V9.28 COMBINED VERIFIED BTC TURBOBOT LOCK DAYSTOP",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -1632,7 +1695,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.26 COMBINED TURBOBOT RUNNER MODE NO DAILY TARGET BLOCK",
+        "version": "app.py V9.28 COMBINED VERIFIED BTC TURBOBOT LOCK DAYSTOP",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -1905,7 +1968,7 @@ def reset_state_route():
 
 @app.route("/send")
 def send_test():
-    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.23 COMBINED TURBOBOT PARSE FIX BTC 0.004")
+    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.28 COMBINED VERIFIED BTC TURBOBOT LOCK DAYSTOP")
     return jsonify({"ok": ok, "status": "test gestuurd"})
 
 

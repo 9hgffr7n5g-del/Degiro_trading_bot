@@ -1679,7 +1679,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "Rene Kraken BTC Spot Bot + Turbobot Paper Engine draait",
-        "version": "app.py V9.28 COMBINED VERIFIED BTC TURBOBOT LOCK DAYSTOP",
+        "version": "app.py V9.29 COMBINED BTC FULL POSITION SELL FIX",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -1695,7 +1695,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.28 COMBINED VERIFIED BTC TURBOBOT LOCK DAYSTOP",
+        "version": "app.py V9.29 COMBINED BTC FULL POSITION SELL FIX",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -2068,10 +2068,16 @@ Kraken result:
             return "ok", 200
 
         btc_balance = get_btc_balance()
-        sell_volume = min(bot_pos, volume_float, btc_balance)
+
+        # V9.29 BTC FULL POSITION SELL FIX
+        # A BTC_SELL closes the complete server-tracked bot position.
+        # Do not use Pine/payload volume here, because old Pine inputs can send 0.0004
+        # while the current bot position is 0.004. The server state is leading.
+        # Safety remains: never sell more than bot-owned position, Kraken balance, or MAX_BOT_POSITION_BTC.
+        sell_volume = min(bot_pos, btc_balance, MAX_BOT_POSITION_BTC)
 
         if sell_volume < MIN_BTC_VOLUME:
-            send_telegram(blocked_message(data, f"SELL genegeerd: onvoldoende verkoopbaar BTC. Botpositie: {bot_pos:.8f}, Kraken saldo: {btc_balance:.8f}, gevraagd: {volume}."))
+            send_telegram(blocked_message(data, f"SELL genegeerd: onvoldoende verkoopbaar BTC. Botpositie: {bot_pos:.8f}, Kraken saldo: {btc_balance:.8f}, server-sell: {sell_volume:.8f}."))
             return "ok", 200
 
         entry_before = fval(state.get("avg_entry_price"), None)

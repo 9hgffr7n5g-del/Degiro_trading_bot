@@ -283,14 +283,24 @@ def fmt(value, decimals=1):
         return str(value)
 
 
-def fmt_eur(value, decimals=4):
+def fmt_nl(value, decimals=2, sign=False):
     try:
         x = float(value)
+        txt = f"{x:+.{decimals}f}" if sign else f"{x:.{decimals}f}"
+        return txt.replace(".", ",")
+    except Exception:
+        return str(value)
+
+
+def fmt_eur(value, decimals=2):
+    try:
+        x = float(value)
+        amount = f"{abs(x):.{decimals}f}".replace(".", ",")
         if x > 0:
-            return f"+EUR {x:.{decimals}f}"
+            return f"+EUR {amount}"
         if x < 0:
-            return f"-EUR {abs(x):.{decimals}f}"
-        return f"EUR {x:.{decimals}f}"
+            return f"-EUR {amount}"
+        return f"EUR {amount}"
     except Exception:
         return str(value)
 
@@ -298,7 +308,7 @@ def fmt_eur(value, decimals=4):
 def fmt_eur_abs(value, decimals=2):
     try:
         x = float(value)
-        return f"EUR {x:.{decimals}f}"
+        return f"EUR {x:.{decimals}f}".replace(".", ",")
     except Exception:
         return str(value)
 
@@ -307,7 +317,7 @@ def fmt_pct(value, decimals=2):
     try:
         x = float(value)
         sign = "+" if x > 0 else ""
-        return f"{sign}{x:.{decimals}f}%"
+        return f"{sign}{x:.{decimals}f}%".replace(".", ",")
     except Exception:
         return str(value)
 
@@ -1106,6 +1116,40 @@ def tb_close_position(state, price, data, reason=""):
     return state, closed
 
 
+def tb_display_signal(signal):
+    sig = clean(signal).upper().replace("_", " ")
+    mapping = {
+        "LONG": "LONG IN",
+        "SHORT": "SHORT IN",
+        "SELL LONG": "LONG OUT",
+        "SELL_LONG": "LONG OUT",
+        "BUY SHORT": "SHORT OUT",
+        "BUY_SHORT": "SHORT OUT",
+        "SHORT -> LONG": "SHORT OUT + LONG IN",
+        "LONG -> SHORT": "LONG OUT + SHORT IN",
+        "SHORT GESLOTEN": "SHORT OUT",
+        "LONG GESLOTEN": "LONG OUT",
+        "GEEN GELDIGE PRIJS": "GEEN GELDIGE PRIJS",
+    }
+    return mapping.get(sig, sig)
+
+
+def tb_compact_extra_lines(extra_lines):
+    out = []
+    for line in extra_lines or []:
+        txt = clean(line)
+        if not txt:
+            continue
+        txt = txt.replace("Nieuwe paper LONG geopend.", "Nieuwe positie: LONG")
+        txt = txt.replace("Nieuwe paper SHORT geopend.", "Nieuwe positie: SHORT")
+        txt = txt.replace("SHORT gesloten:", "Resultaat SHORT:")
+        txt = txt.replace("LONG gesloten:", "Resultaat LONG:")
+        txt = txt.replace("SELL_LONG", "LONG OUT")
+        txt = txt.replace("BUY_SHORT", "SHORT OUT")
+        out.append(txt)
+    return out
+
+
 def tb_status_lines(state, price=None):
     open_eur, open_pct = tb_open_pnl(state, price if price is not None else state.get("last_price"))
     pos = clean(state.get("position")).upper() or "FLAT"
@@ -1127,24 +1171,23 @@ def tb_format_message(kind, signal, state, price, data, extra_lines=None):
     reason = tb_reason_from_data(data)
     pos = clean(state.get("position")).upper() or "FLAT"
     open_eur, open_pct = tb_open_pnl(state, price)
+    display_signal = tb_display_signal(signal)
 
+    # V9.32: Telegram kort en leesbaar, met komma en 2 decimalen.
     lines = [
-        f"TURBOBOT {signal}",
-        f"Ticker: {symbol} {tf}",
-        f"Prijs: {fmt(price, 3)}",
-        f"Positie: {pos}",
-        f"Paper: EUR {TURBOBOT_START_CAPITAL:.0f} | inzet {TURBOBOT_TRADE_FRACTION * 100:.0f}% | hefboom {TURBOBOT_LEVERAGE:.1f}x",
-        f"Dag P/L: {fmt_eur(fval(state.get('daily_realized_eur'), 0.0))} ({fval(state.get('daily_realized_pct'), 0.0):+.2f}%)",
-        f"Runner mode: {'AAN' if (bval(state.get('daily_target_hit')) and TURBOBOT_RUNNER_MODE_AFTER_TARGET and not TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES) else 'nee'}",
+        f"TURBOBOT {display_signal}",
+        f"{symbol} {tf} | prijs {fmt_nl(price, 2)}",
+        f"Positie nu: {pos}",
+        f"Dag P/L: {fmt_eur(fval(state.get('daily_realized_eur'), 0.0))} ({fmt_pct(state.get('daily_realized_pct'))})",
         f"Trades: {int(state.get('daily_closed_trades') or 0)} | W/L/F {int(state.get('daily_wins') or 0)}/{int(state.get('daily_losses') or 0)}/{int(state.get('daily_flats') or 0)}",
     ]
     if pos in ["LONG", "SHORT"]:
-        lines.append(f"Open P/L: {fmt_eur(open_eur)} ({open_pct:+.2f}%)")
+        lines.append(f"Open P/L: {fmt_eur(open_eur)} ({fmt_pct(open_pct)})")
+    compact_extra = tb_compact_extra_lines(extra_lines)
+    if compact_extra:
+        lines += compact_extra
     if reason:
         lines.append(f"Reden: {reason}")
-    if extra_lines:
-        # Houd alleen de nuttige extra regels; geen lange debugdump in normale Telegram.
-        lines += [line for line in extra_lines if clean(line)]
     lines.append(f"Tijd: {local_time_str()}")
     return "\n".join(lines)
 
@@ -1394,8 +1437,8 @@ def format_turbobot_daily_summary(date_str=None):
         "",
         f"Datum: {local_dt(start).strftime('%d-%m-%Y')}",
         "Mode: PAPER / SIGNAL ONLY",
-        f"Startkapitaal per ticker sim: EUR {TURBOBOT_START_CAPITAL:.2f}",
-        f"Inzet per trade: {TURBOBOT_TRADE_FRACTION * 100:.0f}% | hefboom {TURBOBOT_LEVERAGE:.1f}x",
+        f"Startkapitaal per ticker sim: {fmt_eur_abs(TURBOBOT_START_CAPITAL)}",
+        f"Inzet per trade: {TURBOBOT_TRADE_FRACTION * 100:.0f}% | hefboom {fmt_nl(TURBOBOT_LEVERAGE, 1)}x",
         "",
         "Totaal gesloten vandaag:",
         f"Trades: {len(closed)} | W/L/F {wins}/{losses}/{flats} | Winrate {winrate:.1f}%",

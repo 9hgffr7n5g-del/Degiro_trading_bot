@@ -16,6 +16,8 @@ except Exception:
 
 app = Flask(__name__)
 
+# V9.31 COMBINED - BTC full position sell fix + Turbobot multi-symbol paper state + 22:02 daily overview.
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY")
@@ -85,12 +87,12 @@ TURBOBOT_LOCK_MIN_OPEN_PCT = float(os.environ.get("TURBOBOT_LOCK_MIN_OPEN_PCT", 
 
 # AUTO DAILY TELEGRAM REPORTS - Render-side, Pine blijft leeg.
 # BTC/Kraken live dagoverzicht om 22:02 Europe/Amsterdam.
-# Turbobot/LEV paper dagoverzicht om 22:15 Europe/Amsterdam.
+# Turbobot/LEV paper dagoverzicht om 22:02 Europe/Amsterdam.
 AUTO_DAILY_REPORTS_ENABLED = env_bval(os.environ.get("AUTO_DAILY_REPORTS_ENABLED", "true"))
 BTC_DAILY_REPORT_HOUR = int(os.environ.get("BTC_DAILY_REPORT_HOUR", "22"))
 BTC_DAILY_REPORT_MINUTE = int(os.environ.get("BTC_DAILY_REPORT_MINUTE", "2"))
 TURBOBOT_DAILY_REPORT_HOUR = int(os.environ.get("TURBOBOT_DAILY_REPORT_HOUR", "22"))
-TURBOBOT_DAILY_REPORT_MINUTE = int(os.environ.get("TURBOBOT_DAILY_REPORT_MINUTE", "15"))
+TURBOBOT_DAILY_REPORT_MINUTE = int(os.environ.get("TURBOBOT_DAILY_REPORT_MINUTE", "2"))
 AUTO_DAILY_REPORT_CHECK_SEC = int(os.environ.get("AUTO_DAILY_REPORT_CHECK_SEC", "20"))
 AUTO_DAILY_REPORT_WINDOW_MIN = int(os.environ.get("AUTO_DAILY_REPORT_WINDOW_MIN", "3"))
 AUTO_SUMMARY_STATE_FILE = os.environ.get("AUTO_SUMMARY_STATE_FILE", "/data/auto_summary_state.json" if os.path.isdir("/data") else "auto_summary_state.json")
@@ -772,6 +774,108 @@ def tb_reset_state():
     return s
 
 
+
+# V9.31: Turbobot multi-symbol paper state.
+# Elke ticker krijgt zijn eigen positie, kapitaal en dagstats. Daardoor kan NBIS
+# open staan terwijl SXRV/NVDA apart paper-trades bijhouden, zonder P/L te mengen.
+def tb_symbol_key(symbol):
+    raw = clean(symbol).upper()
+    if ":" in raw:
+        raw = raw.split(":")[-1]
+    raw = raw.replace("/", "").replace("-", "").replace(" ", "")
+    return raw or "UNKNOWN"
+
+
+def tb_new_symbol_state(symbol_key=""):
+    st = DEFAULT_TURBOBOT_STATE.copy()
+    st["server_started_ts"] = now_ts()
+    st["daily_date"] = local_date_str()
+    st["symbol"] = clean(symbol_key)
+    st["position"] = "FLAT"
+    st["entry_price"] = None
+    st["entry_ts"] = None
+    st["entry_signal"] = ""
+    st["entry_reason"] = ""
+    st["trade_size_eur"] = None
+    return st
+
+
+def tb_roll_all_days_if_needed(all_state):
+    if not isinstance(all_state, dict):
+        all_state = {}
+    all_state.setdefault("version", "V9.31_MULTI_SYMBOL")
+    all_state.setdefault("symbols", {})
+    for key, st in list(all_state.get("symbols", {}).items()):
+        if not isinstance(st, dict):
+            st = tb_new_symbol_state(key)
+        st.setdefault("symbol", key)
+        all_state["symbols"][key] = tb_roll_day_if_needed(st)
+    return all_state
+
+
+def tb_load_all_state():
+    with TURBOBOT_LOCK:
+        try:
+            if os.path.exists(TURBOBOT_STATE_FILE):
+                with open(TURBOBOT_STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # Nieuwe multi-symbol structuur.
+                if isinstance(data, dict) and isinstance(data.get("symbols"), dict):
+                    return tb_roll_all_days_if_needed(data)
+                # Legacy V9.30 of ouder: migreer naar 1 symbol-state, zodat bestaande
+                # paper-state niet direct verloren gaat. Bij vervuilde P/L alsnog /reset_turbobot doen.
+                if isinstance(data, dict):
+                    legacy = DEFAULT_TURBOBOT_STATE.copy()
+                    legacy.update(data)
+                    legacy = tb_roll_day_if_needed(legacy)
+                    key = tb_symbol_key(legacy.get("symbol") or "LEGACY")
+                    return tb_roll_all_days_if_needed({"version": "V9.31_MULTI_SYMBOL", "symbols": {key: legacy}, "migrated_from_legacy": True})
+        except Exception as e:
+            print("Turbobot multi state load error:", e)
+        return tb_roll_all_days_if_needed({"version": "V9.31_MULTI_SYMBOL", "symbols": {}})
+
+
+def tb_save_all_state(all_state):
+    with TURBOBOT_LOCK:
+        ensure_parent(TURBOBOT_STATE_FILE)
+        all_state = tb_roll_all_days_if_needed(all_state)
+        all_state["last_update_ts"] = now_ts()
+        with open(TURBOBOT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(all_state, f, indent=2)
+
+
+def tb_get_symbol_state(all_state, symbol_key):
+    symbol_key = tb_symbol_key(symbol_key)
+    all_state = tb_roll_all_days_if_needed(all_state)
+    symbols = all_state.setdefault("symbols", {})
+    if symbol_key not in symbols or not isinstance(symbols.get(symbol_key), dict):
+        symbols[symbol_key] = tb_new_symbol_state(symbol_key)
+    st = DEFAULT_TURBOBOT_STATE.copy()
+    st.update(symbols[symbol_key])
+    st["symbol"] = symbol_key
+    return tb_roll_day_if_needed(st)
+
+
+def tb_set_symbol_state(all_state, symbol_key, state):
+    symbol_key = tb_symbol_key(symbol_key)
+    all_state = tb_roll_all_days_if_needed(all_state)
+    state = tb_roll_day_if_needed(state)
+    state["symbol"] = symbol_key
+    all_state.setdefault("symbols", {})[symbol_key] = state
+    return all_state
+
+
+def tb_reset_all_state():
+    all_state = {"version": "V9.31_MULTI_SYMBOL", "symbols": {}, "server_started_ts": now_ts()}
+    tb_save_all_state(all_state)
+    return all_state
+
+
+def tb_all_symbol_states():
+    all_state = tb_load_all_state()
+    return all_state.get("symbols", {}) if isinstance(all_state, dict) else {}
+
+
 def tb_load_events():
     with TURBOBOT_LOG_LOCK:
         try:
@@ -1046,80 +1150,93 @@ def tb_format_message(kind, signal, state, price, data, extra_lines=None):
 
 
 def handle_turbobot_alert(data):
-    state = tb_load_state()
+    all_state = tb_load_all_state()
+    incoming_symbol_raw = tb_symbol_from_data(data)
+    symbol_key = tb_symbol_key(incoming_symbol_raw)
+    state = tb_get_symbol_state(all_state, symbol_key)
     tb_roll_day_if_needed(state)
     signal = tb_signal_from_data(data)
     price = tb_price_from_data(data)
+
+    def save_current():
+        nonlocal all_state, state
+        all_state = tb_set_symbol_state(all_state, symbol_key, state)
+        tb_save_all_state(all_state)
+
     if price is None or price <= 0:
         msg = tb_format_message("BLOCK", "GEEN GELDIGE PRIJS", state, 0, data, ["Alert genegeerd: price/close ontbreekt."])
         send_telegram(msg)
-        return {"ok": False, "reason": "missing_price", "signal": signal, "state": state}
+        return {"ok": False, "reason": "missing_price", "signal": signal, "state": state, "symbol": symbol_key}
 
     state["last_signal"] = signal
     state["last_price"] = price
+    state["symbol"] = symbol_key
     pos = clean(state.get("position")).upper() or "FLAT"
 
+    # V9.31: geen symbol-mismatch block meer. Elke ticker heeft eigen state.
+    # NBIS, SXRV, NVDA enz. kunnen dus tegelijk paper-posities hebben met juiste P/L.
+
     # V9.27: na dagstop geen Telegram-spam meer voor nieuwe entries/locks/loze exits.
-    # Dit verandert niets aan Pine of dagrapport; het houdt alleen Render schoon.
     if bval(state.get("daily_stop_hit")) and TURBOBOT_SILENCE_AFTER_DAILY_STOP:
         if pos == "FLAT" and signal in ["LONG", "SHORT", "LOCK_LONG", "LOCK_SHORT", "SELL_LONG", "BUY_SHORT"]:
-            tb_append_event({"type": "SILENT_AFTER_DAYSTOP", "signal": signal, "price": price, "position": pos, "raw": data})
-            tb_save_state(state)
-            return {"ok": True, "signal": signal, "silent": True, "reason": "daily_stop_flat", "state": state}
+            tb_append_event({"type": "SILENT_AFTER_DAYSTOP", "signal": signal, "symbol": symbol_key, "price": price, "position": pos, "raw": data})
+            save_current()
+            return {"ok": True, "signal": signal, "silent": True, "reason": "daily_stop_flat", "state": state, "symbol": symbol_key}
 
     response_kind = "INFO"
     response_signal = signal
     extra = []
 
-    # V9.27: LOCK is alleen winstbescherming/handrem. Geen lock bij verlies en geen onbekend-signaal spam.
     if signal == "LOCK_LONG":
         if pos == "LONG":
             open_eur, open_pct = tb_open_pnl(state, price)
             if (not TURBOBOT_LOCK_REQUIRES_PROFIT) or open_pct > TURBOBOT_LOCK_MIN_OPEN_PCT:
                 state["daily_locks"] = int(state.get("daily_locks") or 0) + 1
-                tb_append_event({"type": "LOCK", "side": "LONG", "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "raw": data})
+                tb_append_event({"type": "LOCK", "side": "LONG", "symbol": symbol_key, "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "raw": data})
                 response_kind = "LOCK"
                 extra = ["LOCK_LONG bevestigd: winst beschermen / trailing aanscherpen. Geen paper-close."]
             else:
-                tb_append_event({"type": "LOCK_IGNORED", "side": "LONG", "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "reason": "no_profit", "raw": data})
-                tb_save_state(state)
+                tb_append_event({"type": "LOCK_IGNORED", "side": "LONG", "symbol": symbol_key, "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "reason": "no_profit", "raw": data})
+                save_current()
                 if TURBOBOT_SILENCE_BAD_LOCKS:
-                    return {"ok": True, "signal": signal, "silent": True, "reason": "lock_without_profit", "state": state}
+                    return {"ok": True, "signal": signal, "silent": True, "reason": "lock_without_profit", "state": state, "symbol": symbol_key}
                 response_kind = "INFO"
                 extra = [f"LOCK_LONG genegeerd: open P/L is {fmt_pct(open_pct)}."]
         else:
-            tb_append_event({"type": "LOCK_IGNORED", "side": "LONG", "price": price, "position": pos, "reason": "wrong_position", "raw": data})
-            tb_save_state(state)
+            tb_append_event({"type": "LOCK_IGNORED", "side": "LONG", "symbol": symbol_key, "price": price, "position": pos, "reason": "wrong_position", "raw": data})
+            save_current()
             if TURBOBOT_SILENCE_BAD_LOCKS:
-                return {"ok": True, "signal": signal, "silent": True, "reason": "lock_wrong_position", "state": state}
+                return {"ok": True, "signal": signal, "silent": True, "reason": "lock_wrong_position", "state": state, "symbol": symbol_key}
             response_kind = "INFO"
             extra = [f"LOCK_LONG genegeerd: huidige positie is {pos}."]
+
     elif signal == "LOCK_SHORT":
         if pos == "SHORT":
             open_eur, open_pct = tb_open_pnl(state, price)
             if (not TURBOBOT_LOCK_REQUIRES_PROFIT) or open_pct > TURBOBOT_LOCK_MIN_OPEN_PCT:
                 state["daily_locks"] = int(state.get("daily_locks") or 0) + 1
-                tb_append_event({"type": "LOCK", "side": "SHORT", "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "raw": data})
+                tb_append_event({"type": "LOCK", "side": "SHORT", "symbol": symbol_key, "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "raw": data})
                 response_kind = "LOCK"
                 extra = ["LOCK_SHORT bevestigd: winst beschermen / trailing aanscherpen. Geen paper-close."]
             else:
-                tb_append_event({"type": "LOCK_IGNORED", "side": "SHORT", "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "reason": "no_profit", "raw": data})
-                tb_save_state(state)
+                tb_append_event({"type": "LOCK_IGNORED", "side": "SHORT", "symbol": symbol_key, "price": price, "open_pnl_eur": open_eur, "open_pnl_pct": open_pct, "reason": "no_profit", "raw": data})
+                save_current()
                 if TURBOBOT_SILENCE_BAD_LOCKS:
-                    return {"ok": True, "signal": signal, "silent": True, "reason": "lock_without_profit", "state": state}
+                    return {"ok": True, "signal": signal, "silent": True, "reason": "lock_without_profit", "state": state, "symbol": symbol_key}
                 response_kind = "INFO"
                 extra = [f"LOCK_SHORT genegeerd: open P/L is {fmt_pct(open_pct)}."]
         else:
-            tb_append_event({"type": "LOCK_IGNORED", "side": "SHORT", "price": price, "position": pos, "reason": "wrong_position", "raw": data})
-            tb_save_state(state)
+            tb_append_event({"type": "LOCK_IGNORED", "side": "SHORT", "symbol": symbol_key, "price": price, "position": pos, "reason": "wrong_position", "raw": data})
+            save_current()
             if TURBOBOT_SILENCE_BAD_LOCKS:
-                return {"ok": True, "signal": signal, "silent": True, "reason": "lock_wrong_position", "state": state}
+                return {"ok": True, "signal": signal, "silent": True, "reason": "lock_wrong_position", "state": state, "symbol": symbol_key}
             response_kind = "INFO"
             extra = [f"LOCK_SHORT genegeerd: huidige positie is {pos}."]
+
     elif signal == "LONG":
         if pos == "LONG":
             response_kind = "INFO"
-            extra = ["LONG genegeerd: Turbobot staat al LONG."]
+            extra = ["LONG genegeerd: Turbobot staat al LONG op deze ticker."]
         elif pos == "SHORT":
             state, closed = tb_close_position(state, price, data, "FLIP SHORT -> LONG")
             can_open, why = tb_can_open_new_trade(state)
@@ -1139,16 +1256,17 @@ def handle_turbobot_alert(data):
                 response_kind = "LONG"
                 extra = ["Nieuwe paper LONG geopend."]
             else:
-                tb_append_event({"type": "OPEN_BLOCKED", "side": "LONG", "price": price, "reason": why, "raw": data})
-                tb_save_state(state)
+                tb_append_event({"type": "OPEN_BLOCKED", "side": "LONG", "symbol": symbol_key, "price": price, "reason": why, "raw": data})
+                save_current()
                 if bval(state.get("daily_stop_hit")) and TURBOBOT_SILENCE_AFTER_DAILY_STOP:
-                    return {"ok": True, "signal": signal, "silent": True, "reason": "daily_stop", "state": state}
+                    return {"ok": True, "signal": signal, "silent": True, "reason": "daily_stop", "state": state, "symbol": symbol_key}
                 response_kind = "BLOCK"
                 extra = [f"LONG geblokkeerd: {why}"]
+
     elif signal == "SHORT":
         if pos == "SHORT":
             response_kind = "INFO"
-            extra = ["SHORT genegeerd: Turbobot staat al SHORT."]
+            extra = ["SHORT genegeerd: Turbobot staat al SHORT op deze ticker."]
         elif pos == "LONG":
             state, closed = tb_close_position(state, price, data, "FLIP LONG -> SHORT")
             can_open, why = tb_can_open_new_trade(state)
@@ -1168,12 +1286,13 @@ def handle_turbobot_alert(data):
                 response_kind = "SHORT"
                 extra = ["Nieuwe paper SHORT geopend."]
             else:
-                tb_append_event({"type": "OPEN_BLOCKED", "side": "SHORT", "price": price, "reason": why, "raw": data})
-                tb_save_state(state)
+                tb_append_event({"type": "OPEN_BLOCKED", "side": "SHORT", "symbol": symbol_key, "price": price, "reason": why, "raw": data})
+                save_current()
                 if bval(state.get("daily_stop_hit")) and TURBOBOT_SILENCE_AFTER_DAILY_STOP:
-                    return {"ok": True, "signal": signal, "silent": True, "reason": "daily_stop", "state": state}
+                    return {"ok": True, "signal": signal, "silent": True, "reason": "daily_stop", "state": state, "symbol": symbol_key}
                 response_kind = "BLOCK"
                 extra = [f"SHORT geblokkeerd: {why}"]
+
     elif signal == "SELL_LONG":
         if pos == "LONG":
             state, closed = tb_close_position(state, price, data, "SELL_LONG")
@@ -1181,12 +1300,13 @@ def handle_turbobot_alert(data):
             response_signal = "SELL LONG"
             extra = [f"LONG gesloten: {fmt_eur(closed.get('pnl_eur'))} ({fmt_pct(closed.get('pnl_pct'))})"]
         else:
-            tb_append_event({"type": "EXIT_IGNORED", "signal": signal, "price": price, "position": pos, "raw": data})
-            tb_save_state(state)
+            tb_append_event({"type": "EXIT_IGNORED", "signal": signal, "symbol": symbol_key, "price": price, "position": pos, "raw": data})
+            save_current()
             if TURBOBOT_SILENCE_IGNORED_FLAT_EXITS:
-                return {"ok": True, "signal": signal, "silent": True, "reason": "flat_exit_ignored", "state": state}
+                return {"ok": True, "signal": signal, "silent": True, "reason": "flat_exit_ignored", "state": state, "symbol": symbol_key}
             response_kind = "INFO"
-            extra = [f"SELL_LONG genegeerd: huidige positie is {pos}."]
+            extra = [f"SELL_LONG genegeerd: huidige positie op {symbol_key} is {pos}."]
+
     elif signal == "BUY_SHORT":
         if pos == "SHORT":
             state, closed = tb_close_position(state, price, data, "BUY_SHORT")
@@ -1194,21 +1314,21 @@ def handle_turbobot_alert(data):
             response_signal = "BUY SHORT"
             extra = [f"SHORT gesloten: {fmt_eur(closed.get('pnl_eur'))} ({fmt_pct(closed.get('pnl_pct'))})"]
         else:
-            tb_append_event({"type": "EXIT_IGNORED", "signal": signal, "price": price, "position": pos, "raw": data})
-            tb_save_state(state)
+            tb_append_event({"type": "EXIT_IGNORED", "signal": signal, "symbol": symbol_key, "price": price, "position": pos, "raw": data})
+            save_current()
             if TURBOBOT_SILENCE_IGNORED_FLAT_EXITS:
-                return {"ok": True, "signal": signal, "silent": True, "reason": "flat_exit_ignored", "state": state}
+                return {"ok": True, "signal": signal, "silent": True, "reason": "flat_exit_ignored", "state": state, "symbol": symbol_key}
             response_kind = "INFO"
-            extra = [f"BUY_SHORT genegeerd: huidige positie is {pos}."]
+            extra = [f"BUY_SHORT genegeerd: huidige positie op {symbol_key} is {pos}."]
     else:
         response_kind = "BLOCK"
         extra = [f"Onbekend Turbobot-signaal: {signal}"]
 
     tb_roll_day_if_needed(state)
-    tb_save_state(state)
+    save_current()
     msg = tb_format_message(response_kind, response_signal, state, price, data, extra)
     send_telegram(msg)
-    return {"ok": True, "signal": signal, "state": state, "message": msg}
+    return {"ok": True, "signal": signal, "state": state, "symbol": symbol_key, "message": msg}
 
 def tb_events_in_period(start_ts=None, end_ts=None):
     out = []
@@ -1237,37 +1357,72 @@ def format_turbobot_daily_summary(date_str=None):
     best = max(closed, key=lambda e: fval(e.get("pnl_eur"), 0.0), default=None)
     worst = min(closed, key=lambda e: fval(e.get("pnl_eur"), 0.0), default=None)
     winrate = wins / len(closed) * 100.0 if closed else 0.0
-    state = tb_load_state()
+
+    # Per-symbol samenvatting uit gesloten trades.
+    symbol_stats = {}
+    for e in closed:
+        sym = tb_symbol_key(e.get("symbol") or "UNKNOWN")
+        st = symbol_stats.setdefault(sym, {"closed": 0, "wins": 0, "losses": 0, "flats": 0, "pnl": 0.0, "longs": 0, "shorts": 0})
+        st["closed"] += 1
+        st["pnl"] += fval(e.get("pnl_eur"), 0.0)
+        side = clean(e.get("side")).upper()
+        if side == "LONG":
+            st["longs"] += 1
+        if side == "SHORT":
+            st["shorts"] += 1
+        res = clean(e.get("result")).upper()
+        if res == "WIN":
+            st["wins"] += 1
+        elif res == "LOSS":
+            st["losses"] += 1
+        else:
+            st["flats"] += 1
+
+    all_symbols = tb_all_symbol_states()
+    open_lines = []
+    total_open_eur = 0.0
+    for sym in sorted(all_symbols.keys()):
+        st = all_symbols.get(sym) or {}
+        pos = clean(st.get("position")).upper() or "FLAT"
+        if pos in ["LONG", "SHORT"]:
+            oe, op = tb_open_pnl(st, st.get("last_price"))
+            total_open_eur += oe
+            open_lines.append(f"{sym}: {pos} entry {fmt(st.get('entry_price'), 3)} | open {fmt_eur(oe)} ({fmt_pct(op)})")
 
     lines = [
-        "TURBOBOT DAGREPORT",
+        "TURBOBOT DAGOVERZICHT ALLES",
         "",
         f"Datum: {local_dt(start).strftime('%d-%m-%Y')}",
         "Mode: PAPER / SIGNAL ONLY",
-        f"Startkapitaal sim: EUR {TURBOBOT_START_CAPITAL:.2f}",
-        f"Hefboom sim: {TURBOBOT_LEVERAGE:.1f}x",
-        f"Inzet per trade: {TURBOBOT_TRADE_FRACTION * 100:.0f}%",
+        f"Startkapitaal per ticker sim: EUR {TURBOBOT_START_CAPITAL:.2f}",
+        f"Inzet per trade: {TURBOBOT_TRADE_FRACTION * 100:.0f}% | hefboom {TURBOBOT_LEVERAGE:.1f}x",
         "",
-        f"Gesloten trades: {len(closed)}",
-        f"Wins: {wins}",
-        f"Losses: {losses}",
-        f"Flats: {flats}",
-        f"Winrate: {winrate:.1f}%",
-        f"Long trades: {longs}",
-        f"Short trades: {shorts}",
-        f"Locks: {len(locks)}",
-        "",
-        f"Dag P/L: {fmt_eur(pnl_eur)} ({fmt_pct(pnl_pct)})",
-        f"Dagtarget {TURBOBOT_DAILY_TARGET_PCT:.1f}%: {'JA' if pnl_pct >= TURBOBOT_DAILY_TARGET_PCT else 'nee'}",
-        f"Runner mode na target: {'AAN' if (pnl_pct >= TURBOBOT_DAILY_TARGET_PCT and TURBOBOT_RUNNER_MODE_AFTER_TARGET and not TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES) else 'nee'}",
-        f"Dagtarget blokkeert nieuwe trades: {'JA' if TURBOBOT_DAILY_TARGET_BLOCKS_NEW_TRADES else 'nee'}",
-        f"Dagstop {TURBOBOT_DAILY_STOP_PCT:.1f}%: {'JA' if pnl_pct <= TURBOBOT_DAILY_STOP_PCT else 'nee'}",
+        "Totaal gesloten vandaag:",
+        f"Trades: {len(closed)} | W/L/F {wins}/{losses}/{flats} | Winrate {winrate:.1f}%",
+        f"Long gesloten: {longs} | Short gesloten: {shorts} | Locks: {len(locks)}",
+        f"Gesloten P/L totaal: {fmt_eur(pnl_eur)} ({fmt_pct(pnl_pct)} t.o.v. 1 startkapitaal)",
+        f"Open P/L totaal nu: {fmt_eur(total_open_eur)}",
     ]
+
     if best:
-        lines.append(f"Beste trade: {fmt_eur(best.get('pnl_eur'))} ({fmt_pct(best.get('pnl_pct'))})")
+        lines.append(f"Beste trade: {tb_symbol_key(best.get('symbol'))} {clean(best.get('side'))} {fmt_eur(best.get('pnl_eur'))} ({fmt_pct(best.get('pnl_pct'))})")
     if worst:
-        lines.append(f"Slechtste trade: {fmt_eur(worst.get('pnl_eur'))} ({fmt_pct(worst.get('pnl_pct'))})")
-    lines += ["", "Open status:", *tb_status_lines(state, state.get("last_price"))]
+        lines.append(f"Slechtste trade: {tb_symbol_key(worst.get('symbol'))} {clean(worst.get('side'))} {fmt_eur(worst.get('pnl_eur'))} ({fmt_pct(worst.get('pnl_pct'))})")
+
+    lines += ["", "Per ticker gesloten:"]
+    if symbol_stats:
+        for sym, st in sorted(symbol_stats.items(), key=lambda kv: fval(kv[1].get("pnl"), 0.0), reverse=True):
+            wr = (st["wins"] / st["closed"] * 100.0) if st["closed"] else 0.0
+            lines.append(f"{sym}: {fmt_eur(st['pnl'])} | {st['closed']} trades | W/L/F {st['wins']}/{st['losses']}/{st['flats']} | WR {wr:.0f}% | L/S {st['longs']}/{st['shorts']}")
+    else:
+        lines.append("Geen gesloten Turbobot trades vandaag.")
+
+    lines += ["", "Open posities:"]
+    if open_lines:
+        lines += open_lines
+    else:
+        lines.append("Geen open Turbobot paper-posities.")
+
     return "\n".join(lines)
 
 def env_live_allowed():
@@ -1917,7 +2072,7 @@ def send_weekly_summary_route():
 @app.route("/turbobot_status")
 def turbobot_status_route():
     return jsonify({
-        "state": tb_load_state(),
+        "multi_symbol_state": tb_load_all_state(),
         "settings": {
             "start_capital": TURBOBOT_START_CAPITAL,
             "trade_fraction": TURBOBOT_TRADE_FRACTION,
@@ -1955,8 +2110,8 @@ def send_turbobot_daily_summary_route():
 
 @app.route("/reset_turbobot", methods=["GET", "POST"])
 def reset_turbobot_route():
-    s = tb_reset_state()
-    send_telegram("LET OP - Turbobot paper-state handmatig gereset. Positie staat nu FLAT.")
+    s = tb_reset_all_state()
+    send_telegram("LET OP - Turbobot multi-symbol paper-state handmatig gereset. Alle tickers staan nu FLAT.")
     return jsonify({"status": "reset", "turbobot_state": s})
 
 @app.route("/reset_state", methods=["GET", "POST"])
@@ -1968,7 +2123,7 @@ def reset_state_route():
 
 @app.route("/send")
 def send_test():
-    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.28 COMBINED VERIFIED BTC TURBOBOT LOCK DAYSTOP")
+    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.31 MULTI SYMBOL TURBOBOT DAILY 22:02")
     return jsonify({"ok": ok, "status": "test gestuurd"})
 
 

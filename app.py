@@ -1654,6 +1654,10 @@ def supported_bot(data):
         "RBT" in text_blob
         or "RENE" in text_blob
         or "BTC SPOT BOT" in text_blob
+        or "BTC TRENDBOT 1" in text_blob
+        or "BTC_TREND_1" in text_blob
+        or "BTC TREND" in text_blob
+        or "TRENDBOT" in text_blob
     )
 
     kraken_context = (
@@ -2009,7 +2013,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 @app.route("/")
 def home():
     return jsonify({
-        "status": "Rene Kraken BTC Spot Bot + BTC Scalp Paper + Turbobot Paper Engine draait",
+        "status": "BTC Trendbot 1 LIVE + BTC Scalp Paper + Turbobot Paper Engine draait",
         "version": "app.py V9.29 COMBINED BTC FULL POSITION SELL FIX",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
@@ -2332,7 +2336,7 @@ def reset_state_route():
 
 @app.route("/send")
 def send_test():
-    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.30 COMBINED BTC DUAL SCALP PAPER TP250")
+    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.32 BTC TRENDBOT 1 + CHOPGUARD LOGGING")
     return jsonify({"ok": ok, "status": "test gestuurd"})
 
 

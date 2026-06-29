@@ -77,6 +77,9 @@ BTC_SCALP_TP_POINTS = float(os.environ.get("BTC_SCALP_TP_POINTS", "250"))
 BTC_SCALP_TRAIL_ENABLED = env_bval(os.environ.get("BTC_SCALP_TRAIL_ENABLED", "true"))
 BTC_SCALP_TRAIL_TRIGGER_POINTS = float(os.environ.get("BTC_SCALP_TRAIL_TRIGGER_POINTS", str(BTC_SCALP_TP_POINTS)))
 BTC_SCALP_TRAIL_STEP_POINTS = float(os.environ.get("BTC_SCALP_TRAIL_STEP_POINTS", "50"))
+BTC_SCALP_EARLY_LOCK_ENABLED = env_bval(os.environ.get("BTC_SCALP_EARLY_LOCK_ENABLED", "true"))
+BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS = float(os.environ.get("BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS", "150"))
+BTC_SCALP_EARLY_LOCK_FLOOR_POINTS = float(os.environ.get("BTC_SCALP_EARLY_LOCK_FLOOR_POINTS", "75"))
 BTC_SCALP_SEND_TELEGRAM = env_bval(os.environ.get("BTC_SCALP_SEND_TELEGRAM", "true"))
 
 
@@ -200,6 +203,9 @@ DEFAULT_BTC_SCALP_STATE = {
     "trail_floor_points": None,
     "trail_trigger_points": BTC_SCALP_TRAIL_TRIGGER_POINTS,
     "trail_step_points": BTC_SCALP_TRAIL_STEP_POINTS,
+    "early_lock_active": False,
+    "early_lock_trigger_points": BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS,
+    "early_lock_floor_points": BTC_SCALP_EARLY_LOCK_FLOOR_POINTS,
     "daily_date": "",
     "daily_closed_trades": 0,
     "daily_wins": 0,
@@ -622,6 +628,7 @@ Geen Kraken-order uitgevoerd.
 Ticker: BTCEUR
 Koers: {fmt(price, 1)}
 Paper BTC: {BTC_SCALP_PAPER_AMOUNT_BTC:.8f}
+Early lock: +{BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS:.0f} -> floor +{BTC_SCALP_EARLY_LOCK_FLOOR_POINTS:.0f}
 Trail trigger: +{BTC_SCALP_TRAIL_TRIGGER_POINTS:.0f} punten
 Trail stap: {BTC_SCALP_TRAIL_STEP_POINTS:.0f} punten
 Reden: {reason}
@@ -652,6 +659,7 @@ def btc_scalp_close(st, price, reason, action_label="SELL"):
     st["max_profit_points"] = None
     st["trail_active"] = False
     st["trail_floor_points"] = None
+    st["early_lock_active"] = False
     st["daily_date"] = local_date_str()
     st["daily_closed_trades"] = int(st.get("daily_closed_trades", 0) or 0) + 1
     if result == "WIN":
@@ -674,6 +682,8 @@ def btc_scalp_close(st, price, reason, action_label="SELL"):
         "reason": reason,
         "action_label": action_label,
         "max_profit_points": st.get("max_profit_points"),
+        "early_lock_active": st.get("early_lock_active"),
+        "early_lock_floor_points": st.get("early_lock_floor_points"),
         "trail_floor_points": st.get("trail_floor_points")
     })
     return st, btc_scalp_exit_message(exitp, reason, st, entry, points, eur, result)
@@ -706,6 +716,17 @@ def handle_btc_scalp_paper(data):
                 max_points = current_points
             st["max_profit_points"] = max_points
 
+            if (BTC_SCALP_EARLY_LOCK_ENABLED
+                    and max_points >= BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS
+                    and max_points < BTC_SCALP_TRAIL_TRIGGER_POINTS):
+                st["early_lock_active"] = True
+                st["early_lock_floor_points"] = BTC_SCALP_EARLY_LOCK_FLOOR_POINTS
+                if current_points < BTC_SCALP_EARLY_LOCK_FLOOR_POINTS:
+                    st, msg = btc_scalp_close(st, price, f"SCALP EARLY LOCK SELL floor +{BTC_SCALP_EARLY_LOCK_FLOOR_POINTS:.0f} punten; max +{max_points:.1f} punten", "EARLY_LOCK")
+                    if msg and BTC_SCALP_SEND_TELEGRAM:
+                        send_telegram(msg, route="scalp")
+                    return {"event": "scalp_early_lock_sell", "position": st.get("position"), "floor_points": BTC_SCALP_EARLY_LOCK_FLOOR_POINTS, "max_points": max_points}
+
             if BTC_SCALP_TRAIL_ENABLED and max_points >= BTC_SCALP_TRAIL_TRIGGER_POINTS:
                 step = BTC_SCALP_TRAIL_STEP_POINTS if BTC_SCALP_TRAIL_STEP_POINTS > 0 else 50.0
                 steps_above = int((max_points - BTC_SCALP_TRAIL_TRIGGER_POINTS) // step)
@@ -736,6 +757,9 @@ def handle_btc_scalp_paper(data):
         st["trail_floor_points"] = None
         st["trail_trigger_points"] = BTC_SCALP_TRAIL_TRIGGER_POINTS
         st["trail_step_points"] = BTC_SCALP_TRAIL_STEP_POINTS
+        st["early_lock_active"] = False
+        st["early_lock_trigger_points"] = BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS
+        st["early_lock_floor_points"] = BTC_SCALP_EARLY_LOCK_FLOOR_POINTS
         st["last_action"] = "BUY"
         st["daily_date"] = local_date_str()
         btc_scalp_save_state(st)
@@ -774,6 +798,7 @@ def format_btc_scalp_daily_summary(date_str=None):
         f"Datum: {title_date}",
         f"Mode: PAPER ONLY - geen Kraken-orders",
         f"Paper BTC per trade: {BTC_SCALP_PAPER_AMOUNT_BTC:.8f}",
+        f"Early lock: +{BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS:.0f} -> floor +{BTC_SCALP_EARLY_LOCK_FLOOR_POINTS:.0f}",
         f"Trail trigger: +{BTC_SCALP_TRAIL_TRIGGER_POINTS:.0f} punten",
         f"Trail stap: {BTC_SCALP_TRAIL_STEP_POINTS:.0f} punten",
         "",
@@ -808,6 +833,7 @@ def format_btc_scalp_total_summary():
         "",
         "Mode: PAPER ONLY - geen Kraken-orders",
         f"Paper BTC per trade: {BTC_SCALP_PAPER_AMOUNT_BTC:.8f}",
+        f"Early lock: +{BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS:.0f} -> floor +{BTC_SCALP_EARLY_LOCK_FLOOR_POINTS:.0f}",
         f"Trail trigger: +{BTC_SCALP_TRAIL_TRIGGER_POINTS:.0f} punten",
         f"Trail stap: {BTC_SCALP_TRAIL_STEP_POINTS:.0f} punten",
         "",

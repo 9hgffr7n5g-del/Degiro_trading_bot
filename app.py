@@ -18,6 +18,15 @@ app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+
+# V9.35: gescheiden Telegram routes voor BTC Trendbot live en BTC Scalpbot paper.
+# Backwards compatible:
+# - CHAT_ID blijft de standaard / Trend live chat.
+# - Zet BTC_SCALP_CHAT_ID of SCALP_CHAT_ID voor aparte Scalp Telegram-chat.
+TREND_BOT_TOKEN = os.environ.get("BTC_TREND_BOT_TOKEN") or os.environ.get("TREND_BOT_TOKEN") or BOT_TOKEN
+TREND_CHAT_ID = os.environ.get("BTC_TREND_CHAT_ID") or os.environ.get("TREND_CHAT_ID") or CHAT_ID
+SCALP_BOT_TOKEN = os.environ.get("BTC_SCALP_BOT_TOKEN") or os.environ.get("SCALP_BOT_TOKEN") or BOT_TOKEN
+SCALP_CHAT_ID = os.environ.get("BTC_SCALP_CHAT_ID") or os.environ.get("SCALP_CHAT_ID") or CHAT_ID
 KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY")
 KRAKEN_API_SECRET = os.environ.get("KRAKEN_API_SECRET")
 
@@ -402,25 +411,35 @@ def update_telegram_state(ok, error=""):
         print("Telegram state update error:", e)
 
 
-def send_telegram(message):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram not configured")
+def telegram_target(route="default"):
+    r = clean(route).lower()
+    if r in ["scalp", "btc_scalp", "btc_scalpbot", "paper"]:
+        return SCALP_BOT_TOKEN, SCALP_CHAT_ID, "BTC_SCALP"
+    if r in ["trend", "btc_trend", "btc_trendbot", "live"]:
+        return TREND_BOT_TOKEN, TREND_CHAT_ID, "BTC_TREND"
+    return BOT_TOKEN, CHAT_ID, "DEFAULT"
+
+
+def send_telegram(message, route="default"):
+    token, chat_id, route_name = telegram_target(route)
+    if not token or not chat_id:
+        print(f"Telegram not configured for {route_name}")
         print(message)
-        update_telegram_state(False, "BOT_TOKEN of CHAT_ID ontbreekt")
+        update_telegram_state(False, f"Telegram config ontbreekt voor {route_name}")
         return False
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=15)
+        r = requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=15)
         if 200 <= r.status_code < 300:
             update_telegram_state(True, "")
             return True
-        err = f"HTTP {r.status_code}: {r.text[:300]}"
+        err = f"{route_name} HTTP {r.status_code}: {r.text[:300]}"
         print("Telegram error:", err)
         update_telegram_state(False, err)
         return False
     except Exception as e:
-        err = str(e)
+        err = f"{route_name} {str(e)}"
         print("Telegram error:", err)
         update_telegram_state(False, err)
         return False
@@ -697,7 +716,7 @@ def handle_btc_scalp_paper(data):
                 if current_points < floor_points:
                     st, msg = btc_scalp_close(st, price, f"SCALP TRAIL SELL floor +{floor_points:.0f} punten; max +{max_points:.1f} punten", "TRAIL")
                     if msg and BTC_SCALP_SEND_TELEGRAM:
-                        send_telegram(msg)
+                        send_telegram(msg, route="scalp")
                     return {"event": "scalp_trail_sell", "position": st.get("position"), "floor_points": floor_points, "max_points": max_points}
 
             btc_scalp_save_state(st)
@@ -728,7 +747,7 @@ def handle_btc_scalp_paper(data):
             "action": action
         })
         if BTC_SCALP_SEND_TELEGRAM:
-            send_telegram(btc_scalp_open_message(price, reason, st))
+            send_telegram(btc_scalp_open_message(price, reason, st), route="scalp")
         return {"event": "scalp_buy", "position": "LONG"}
 
     if action in ["BTC_EXIT", "BTC_SCALP_EXIT"]:
@@ -737,7 +756,7 @@ def handle_btc_scalp_paper(data):
             return {"event": "scalp_exit_ignored_flat", "position": "FLAT"}
         st, msg = btc_scalp_close(st, price, reason, "SELL")
         if msg and BTC_SCALP_SEND_TELEGRAM:
-            send_telegram(msg)
+            send_telegram(msg, route="scalp")
         return {"event": "scalp_sell", "position": st.get("position")}
 
     return None
@@ -2172,7 +2191,7 @@ def btc_scalp_daily_summary_route():
 def send_btc_scalp_daily_summary_route():
     date_str = request.args.get("date") or local_date_str()
     msg = format_btc_scalp_daily_summary(date_str)
-    ok = send_telegram(msg)
+    ok = send_telegram(msg, route="scalp")
     return jsonify({"ok": ok, "message": msg})
 
 
@@ -2185,13 +2204,13 @@ def btc_scalp_total_summary_route():
 @app.route("/send_btc_scalp_total_summary", methods=["GET", "POST"])
 def send_btc_scalp_total_summary_route():
     msg = format_btc_scalp_total_summary()
-    ok = send_telegram(msg)
+    ok = send_telegram(msg, route="scalp")
     return jsonify({"ok": ok, "message": msg})
 
 @app.route("/reset_btc_scalp", methods=["GET", "POST"])
 def reset_btc_scalp_route():
     st = btc_scalp_reset_state()
-    send_telegram("LET OP - BTC Scalp paper-state handmatig gereset. Scalp positie staat nu FLAT.")
+    send_telegram("LET OP - BTC Scalp paper-state handmatig gereset. Scalp positie staat nu FLAT.", route="scalp")
     return jsonify({"status": "reset", "btc_scalp_state": st})
 
 
@@ -2423,8 +2442,20 @@ def reset_state_route():
 
 @app.route("/send")
 def send_test():
-    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.33 BTC TRENDBOT 1 + BTC SCALPBOT 1 PAPER")
-    return jsonify({"ok": ok, "status": "test gestuurd"})
+    ok = send_telegram("TEST BERICHT VAN RENDER BOT - V9.35 BTC TRENDBOT 1 + BTC SCALPBOT 1 APARTE TELEGRAM")
+    return jsonify({"ok": ok, "status": "test gestuurd naar default/trend chat"})
+
+
+@app.route("/send_btc_trend_test")
+def send_btc_trend_test():
+    ok = send_telegram("TEST BTC TRENDBOT 1 LIVE - Telegram route TREND", route="trend")
+    return jsonify({"ok": ok, "route": "trend"})
+
+
+@app.route("/send_btc_scalp_test")
+def send_btc_scalp_test():
+    ok = send_telegram("TEST BTC SCALPBOT 1 PAPER - Telegram route SCALP", route="scalp")
+    return jsonify({"ok": ok, "route": "scalp"})
 
 
 @app.route("/webhook", methods=["POST"])

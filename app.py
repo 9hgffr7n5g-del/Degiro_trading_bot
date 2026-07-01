@@ -19,7 +19,7 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# V9.35: gescheiden Telegram routes voor BTC Trendbot live en BTC Scalpbot paper.
+# V9.37: gescheiden Telegram routes voor BTC Trendbot live en BTC Scalpbot live.
 # Backwards compatible:
 # - CHAT_ID blijft de standaard / Trend live chat.
 # - Zet BTC_SCALP_CHAT_ID of SCALP_CHAT_ID voor aparte Scalp Telegram-chat.
@@ -67,12 +67,14 @@ TRADE_LOG_FILE = os.environ.get("TRADE_LOG_FILE", "/data/trades.json" if os.path
 APP_TZ = os.environ.get("APP_TZ", "Europe/Amsterdam")
 ROUND_TRIP_COST_POINTS = float(os.environ.get("ROUND_TRIP_COST_POINTS", "0.0"))
 
-# BTC Dual 1 Scalp paper engine - geen Kraken-orders.
-# Scalp wordt apart gemeten naast de live Trend/Kraken positie.
+# BTC Scalpbot 1 live engine - aparte Kraken-leg naast Trendbot.
+# Default LIVE volgens afspraak: 0.00400 BTC. Zet BTC_SCALP_LIVE_ENABLED=false voor paper-only.
+BTC_SCALP_LIVE_ENABLED = env_bval(os.environ.get("BTC_SCALP_LIVE_ENABLED", "true"))
 BTC_SCALP_PAPER_ENABLED = env_bval(os.environ.get("BTC_SCALP_PAPER_ENABLED", "true"))
 BTC_SCALP_STATE_FILE = os.environ.get("BTC_SCALP_STATE_FILE", "/data/btc_scalp_state.json" if os.path.isdir("/data") else "btc_scalp_state.json")
 BTC_SCALP_LOG_FILE = os.environ.get("BTC_SCALP_LOG_FILE", "/data/btc_scalp_trades.json" if os.path.isdir("/data") else "btc_scalp_trades.json")
-BTC_SCALP_PAPER_AMOUNT_BTC = float(os.environ.get("BTC_SCALP_PAPER_AMOUNT_BTC", "0.00400"))
+BTC_SCALP_AMOUNT_BTC = float(os.environ.get("BTC_SCALP_AMOUNT_BTC", os.environ.get("BTC_SCALP_PAPER_AMOUNT_BTC", "0.00400")))
+BTC_SCALP_PAPER_AMOUNT_BTC = BTC_SCALP_AMOUNT_BTC
 BTC_SCALP_TP_POINTS = float(os.environ.get("BTC_SCALP_TP_POINTS", "250"))
 BTC_SCALP_TRAIL_ENABLED = env_bval(os.environ.get("BTC_SCALP_TRAIL_ENABLED", "true"))
 BTC_SCALP_TRAIL_TRIGGER_POINTS = float(os.environ.get("BTC_SCALP_TRAIL_TRIGGER_POINTS", str(BTC_SCALP_TP_POINTS)))
@@ -191,7 +193,12 @@ DEFAULT_BTC_SCALP_STATE = {
     "entry_ts": None,
     "entry_reason": "",
     "entry_signal": "",
-    "amount_btc": BTC_SCALP_PAPER_AMOUNT_BTC,
+    "entry_mode": "",
+    "amount_btc": BTC_SCALP_AMOUNT_BTC,
+    "last_buy_order_id": None,
+    "last_buy_ts": None,
+    "last_sell_order_id": None,
+    "last_sell_ts": None,
     "last_price": None,
     "last_action": None,
     "last_update_ts": None,
@@ -526,6 +533,22 @@ def btc_scalp_load_state():
                 st = DEFAULT_BTC_SCALP_STATE.copy()
                 if isinstance(data, dict):
                     st.update(data)
+                # Bij omschakeling van paper naar live: oude paper-open positie nooit als echte Kraken-positie behandelen.
+                if BTC_SCALP_LIVE_ENABLED and st.get("position") == "LONG" and not st.get("last_buy_order_id"):
+                    st["position"] = "FLAT"
+                    st["entry_price"] = None
+                    st["entry_ts"] = None
+                    st["entry_reason"] = "paper positie genegeerd bij live switch"
+                    st["entry_signal"] = ""
+                    st["entry_mode"] = "LIVE_SWITCH_RESET"
+                    st["max_profit_points"] = None
+                    st["trail_active"] = False
+                    st["trail_floor_points"] = None
+                    st["early_lock_active"] = False
+                    ensure_parent(BTC_SCALP_STATE_FILE)
+                    st["last_update_ts"] = now_ts()
+                    with open(BTC_SCALP_STATE_FILE, "w", encoding="utf-8") as fw:
+                        json.dump(st, fw, indent=2)
                 return st
         except Exception as e:
             print("BTC scalp state load error:", e)
@@ -605,16 +628,55 @@ def btc_scalp_summarize(events):
     return {"closed_trades": total, "wins": wins, "losses": losses, "flats": flats, "winrate": winrate, "points": points, "eur": eur, "best": best, "worst": worst}
 
 
-def btc_scalp_exit_message(price, reason, st, entry_price, points, eur, result):
-    return f"""BTC SCALP PAPER SELL
-Geen Kraken-order uitgevoerd.
+def btc_scalp_mode_label():
+    return "LIVE KRAKEN" if BTC_SCALP_LIVE_ENABLED else "PAPER ONLY"
+
+
+def btc_scalp_live_block_reason():
+    if not BTC_SCALP_LIVE_ENABLED:
+        return ""
+    if not env_live_allowed():
+        return "Render environment staat live trading niet toe of dry-run/telegram-only staat nog aan."
+    if not KRAKEN_API_KEY or not KRAKEN_API_SECRET:
+        return "KRAKEN_API_KEY of KRAKEN_API_SECRET ontbreekt."
+    return ""
+
+
+def btc_scalp_order_failed_message(action_label, price, volume, reason, kraken_result=None, block_reason=""):
+    lines = [
+        f"LET OP - KRAKEN SCALP {action_label} NIET uitgevoerd",
+        "Bot: BTC Scalpbot 1",
+        "Ticker: BTCEUR",
+        f"Koers: {fmt(price, 1)}",
+        f"Aantal BTC: {fval(volume, 0.0):.8f}",
+        f"Reden: {reason}",
+        "",
+    ]
+    if block_reason:
+        lines.append(f"Blokkade: {block_reason}")
+    if kraken_result is not None:
+        lines += ["Kraken result:", str(kraken_result)]
+    lines.append(f"Tijd: {local_time_str()}")
+    return "\n".join(lines)
+
+
+def btc_scalp_exit_message(price, reason, st, entry_price, points, eur, result, volume=None, oid=None):
+    live = BTC_SCALP_LIVE_ENABLED
+    title = "KRAKEN SCALP SELL UITGEVOERD" if live else "BTC SCALP PAPER SELL"
+    order_line = f"Order id: {oid}" if live else "Geen Kraken-order uitgevoerd."
+    amount_label = "Aantal BTC" if live else "Paper BTC"
+    eur_label = "Resultaat EUR" if live else "Paper EUR"
+    vol = fval(volume, BTC_SCALP_AMOUNT_BTC)
+    return f"""{title}
+{order_line}
+Bot: BTC Scalpbot 1
 Ticker: BTCEUR
 Koers verkoop: {fmt(price, 1)}
-Paper BTC: {BTC_SCALP_PAPER_AMOUNT_BTC:.8f}
+{amount_label}: {vol:.8f}
 Entry: {fmt(entry_price, 1)}
 Punten: {pts(points)}
 Resultaat: {result}
-Paper EUR: {fmt_eur(eur)}
+{eur_label}: {fmt_eur(eur)}
 Reden: {reason}
 
 Scalp positie: {st.get('position')}
@@ -622,12 +684,17 @@ Tijd: {local_time_str()}
 """
 
 
-def btc_scalp_open_message(price, reason, st):
-    return f"""BTC SCALP PAPER BUY
-Geen Kraken-order uitgevoerd.
+def btc_scalp_open_message(price, reason, st, oid=None):
+    live = BTC_SCALP_LIVE_ENABLED
+    title = "KRAKEN SCALP BUY UITGEVOERD" if live else "BTC SCALP PAPER BUY"
+    order_line = f"Order id: {oid}" if live else "Geen Kraken-order uitgevoerd."
+    amount_label = "Aantal BTC" if live else "Paper BTC"
+    return f"""{title}
+{order_line}
+Bot: BTC Scalpbot 1
 Ticker: BTCEUR
 Koers: {fmt(price, 1)}
-Paper BTC: {BTC_SCALP_PAPER_AMOUNT_BTC:.8f}
+{amount_label}: {BTC_SCALP_AMOUNT_BTC:.8f}
 Early lock: +{BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS:.0f} -> floor +{BTC_SCALP_EARLY_LOCK_FLOOR_POINTS:.0f}
 Trail trigger: +{BTC_SCALP_TRAIL_TRIGGER_POINTS:.0f} punten
 Trail stap: {BTC_SCALP_TRAIL_STEP_POINTS:.0f} punten
@@ -643,15 +710,42 @@ def btc_scalp_close(st, price, reason, action_label="SELL"):
     exitp = fval(price, None)
     if entry is None or exitp is None:
         return st, None
+
+    volume = fval(st.get("amount_btc"), BTC_SCALP_AMOUNT_BTC)
+    oid = None
+
+    if BTC_SCALP_LIVE_ENABLED:
+        if not st.get("last_buy_order_id"):
+            return st, btc_scalp_order_failed_message("SELL", exitp, volume, reason, block_reason="Scalp-state heeft geen live buy order id. Oude paper-positie wordt niet live verkocht.")
+        block_reason = btc_scalp_live_block_reason()
+        if block_reason:
+            return st, btc_scalp_order_failed_message("SELL", exitp, volume, reason, block_reason=block_reason)
+        btc_balance = get_btc_balance()
+        sell_volume = min(volume, btc_balance)
+        if sell_volume < MIN_BTC_VOLUME:
+            return st, btc_scalp_order_failed_message("SELL", exitp, sell_volume, reason, block_reason=f"Onvoldoende verkoopbaar BTC. Scalp-state: {volume:.8f}, Kraken saldo: {btc_balance:.8f}.")
+        res = kraken_sell(f"{sell_volume:.8f}")
+        if not order_ok(res):
+            return st, btc_scalp_order_failed_message("SELL", exitp, sell_volume, reason, kraken_result=res)
+        oid = order_id(res)
+        volume = sell_volume
+
     points = exitp - entry
-    eur = points * BTC_SCALP_PAPER_AMOUNT_BTC
+    eur = points * volume
     result = result_from_points(points)
+    max_points_before = st.get("max_profit_points")
+    early_lock_before = st.get("early_lock_active")
+    early_floor_before = st.get("early_lock_floor_points")
+    trail_floor_before = st.get("trail_floor_points")
+
     st["position"] = "FLAT"
     st["last_price"] = exitp
     st["last_action"] = action_label
     st["last_closed_points"] = points
     st["last_closed_eur"] = eur
     st["last_closed_result"] = result
+    st["last_sell_order_id"] = oid
+    st["last_sell_ts"] = now_ts()
     st["entry_price"] = None
     st["entry_ts"] = None
     st["entry_reason"] = ""
@@ -673,29 +767,29 @@ def btc_scalp_close(st, price, reason, action_label="SELL"):
     btc_scalp_save_state(st)
     btc_scalp_append_event({
         "type": "BTC_SCALP_CLOSED_TRADE",
+        "mode": btc_scalp_mode_label(),
         "entry_price": entry,
         "exit_price": exitp,
-        "amount_btc": BTC_SCALP_PAPER_AMOUNT_BTC,
+        "amount_btc": volume,
         "points": points,
         "gross_eur": eur,
         "result": result,
         "reason": reason,
         "action_label": action_label,
-        "max_profit_points": st.get("max_profit_points"),
-        "early_lock_active": st.get("early_lock_active"),
-        "early_lock_floor_points": st.get("early_lock_floor_points"),
-        "trail_floor_points": st.get("trail_floor_points")
+        "order_id": oid,
+        "max_profit_points": max_points_before,
+        "early_lock_active": early_lock_before,
+        "early_lock_floor_points": early_floor_before,
+        "trail_floor_points": trail_floor_before
     })
-    return st, btc_scalp_exit_message(exitp, reason, st, entry, points, eur, result)
+    return st, btc_scalp_exit_message(exitp, reason, st, entry, points, eur, result, volume=volume, oid=oid)
 
 
-def handle_btc_scalp_paper(data):
-    if not BTC_SCALP_PAPER_ENABLED:
-        return None
+def handle_btc_scalp(data):
     action = clean(data.get("action"))
     if action not in ["BTC_BUY", "BTC_EXIT", "BTC_SCALP_BUY", "BTC_SCALP_EXIT"]:
         return None
-    if not bval(data.get("scalp_signal")) and clean(data.get("scalp_mode")).upper() != "PAPER":
+    if action in ["BTC_BUY", "BTC_EXIT"] and not bval(data.get("scalp_signal")) and clean(data.get("scalp_mode")).upper() != "PAPER":
         return None
 
     price = fval(data.get("price"), None)
@@ -705,8 +799,7 @@ def handle_btc_scalp_paper(data):
     st = btc_scalp_load_state()
     st["last_price"] = price
 
-    # Scalp trailing profit ladder. Geen Kraken-order, alleen paper.
-    # Vanaf +250 wordt winst bewaakt. Daarna schuift de floor per 50 punten mee omhoog.
+    # Scalp trailing profit ladder. In live-mode sluit deze echt op Kraken.
     if st.get("position") == "LONG":
         entry = fval(st.get("entry_price"), None)
         if entry is not None:
@@ -725,7 +818,7 @@ def handle_btc_scalp_paper(data):
                     st, msg = btc_scalp_close(st, price, f"SCALP EARLY LOCK SELL floor +{BTC_SCALP_EARLY_LOCK_FLOOR_POINTS:.0f} punten; max +{max_points:.1f} punten", "EARLY_LOCK")
                     if msg and BTC_SCALP_SEND_TELEGRAM:
                         send_telegram(msg, route="scalp")
-                    return {"event": "scalp_early_lock_sell", "position": st.get("position"), "floor_points": BTC_SCALP_EARLY_LOCK_FLOOR_POINTS, "max_points": max_points}
+                    return {"event": "scalp_early_lock_sell", "mode": btc_scalp_mode_label(), "position": st.get("position"), "floor_points": BTC_SCALP_EARLY_LOCK_FLOOR_POINTS, "max_points": max_points}
 
             if BTC_SCALP_TRAIL_ENABLED and max_points >= BTC_SCALP_TRAIL_TRIGGER_POINTS:
                 step = BTC_SCALP_TRAIL_STEP_POINTS if BTC_SCALP_TRAIL_STEP_POINTS > 0 else 50.0
@@ -738,20 +831,46 @@ def handle_btc_scalp_paper(data):
                     st, msg = btc_scalp_close(st, price, f"SCALP TRAIL SELL floor +{floor_points:.0f} punten; max +{max_points:.1f} punten", "TRAIL")
                     if msg and BTC_SCALP_SEND_TELEGRAM:
                         send_telegram(msg, route="scalp")
-                    return {"event": "scalp_trail_sell", "position": st.get("position"), "floor_points": floor_points, "max_points": max_points}
+                    return {"event": "scalp_trail_sell", "mode": btc_scalp_mode_label(), "position": st.get("position"), "floor_points": floor_points, "max_points": max_points}
 
             btc_scalp_save_state(st)
 
     if action in ["BTC_BUY", "BTC_SCALP_BUY"]:
         if st.get("position") == "LONG":
             btc_scalp_save_state(st)
-            return {"event": "scalp_buy_ignored_already_long", "position": "LONG"}
+            return {"event": "scalp_buy_ignored_already_long", "mode": btc_scalp_mode_label(), "position": "LONG"}
+
+        amount = BTC_SCALP_AMOUNT_BTC
+        oid = None
+        if BTC_SCALP_LIVE_ENABLED:
+            block_reason = btc_scalp_live_block_reason()
+            if block_reason:
+                msg = btc_scalp_order_failed_message("BUY", price, amount, reason, block_reason=block_reason)
+                if BTC_SCALP_SEND_TELEGRAM:
+                    send_telegram(msg, route="scalp")
+                return {"event": "scalp_buy_blocked", "mode": btc_scalp_mode_label(), "reason": block_reason}
+            if amount < MIN_BTC_VOLUME:
+                msg = btc_scalp_order_failed_message("BUY", price, amount, reason, block_reason=f"Ordervolume te laag. Minimum is {MIN_BTC_VOLUME:.8f} BTC.")
+                if BTC_SCALP_SEND_TELEGRAM:
+                    send_telegram(msg, route="scalp")
+                return {"event": "scalp_buy_blocked_volume", "mode": btc_scalp_mode_label()}
+            res = kraken_buy(f"{amount:.8f}")
+            if not order_ok(res):
+                msg = btc_scalp_order_failed_message("BUY", price, amount, reason, kraken_result=res)
+                if BTC_SCALP_SEND_TELEGRAM:
+                    send_telegram(msg, route="scalp")
+                return {"event": "scalp_buy_failed", "mode": btc_scalp_mode_label(), "kraken_result": res}
+            oid = order_id(res)
+
         st["position"] = "LONG"
         st["entry_price"] = price
         st["entry_ts"] = now_ts()
         st["entry_reason"] = reason
         st["entry_signal"] = action
-        st["amount_btc"] = BTC_SCALP_PAPER_AMOUNT_BTC
+        st["entry_mode"] = btc_scalp_mode_label()
+        st["amount_btc"] = amount
+        st["last_buy_order_id"] = oid
+        st["last_buy_ts"] = now_ts()
         st["max_profit_points"] = 0.0
         st["trail_active"] = False
         st["trail_floor_points"] = None
@@ -765,25 +884,28 @@ def handle_btc_scalp_paper(data):
         btc_scalp_save_state(st)
         btc_scalp_append_event({
             "type": "BTC_SCALP_OPEN",
+            "mode": btc_scalp_mode_label(),
             "entry_price": price,
-            "amount_btc": BTC_SCALP_PAPER_AMOUNT_BTC,
+            "amount_btc": amount,
+            "order_id": oid,
             "reason": reason,
             "action": action
         })
         if BTC_SCALP_SEND_TELEGRAM:
-            send_telegram(btc_scalp_open_message(price, reason, st), route="scalp")
-        return {"event": "scalp_buy", "position": "LONG"}
+            send_telegram(btc_scalp_open_message(price, reason, st, oid=oid), route="scalp")
+        return {"event": "scalp_buy", "mode": btc_scalp_mode_label(), "position": "LONG"}
 
     if action in ["BTC_EXIT", "BTC_SCALP_EXIT"]:
         if st.get("position") != "LONG":
             btc_scalp_save_state(st)
-            return {"event": "scalp_exit_ignored_flat", "position": "FLAT"}
+            return {"event": "scalp_exit_ignored_flat", "mode": btc_scalp_mode_label(), "position": "FLAT"}
         st, msg = btc_scalp_close(st, price, reason, "SELL")
         if msg and BTC_SCALP_SEND_TELEGRAM:
             send_telegram(msg, route="scalp")
-        return {"event": "scalp_sell", "position": st.get("position")}
+        return {"event": "scalp_sell", "mode": btc_scalp_mode_label(), "position": st.get("position")}
 
     return None
+
 
 
 def format_btc_scalp_daily_summary(date_str=None):
@@ -793,11 +915,11 @@ def format_btc_scalp_daily_summary(date_str=None):
     st = btc_scalp_load_state()
     title_date = local_dt(start).strftime("%d-%m-%Y")
     lines = [
-        "BTC SCALP PAPER DAGOVERZICHT",
+        "BTC SCALP DAGOVERZICHT",
         "",
         f"Datum: {title_date}",
-        f"Mode: PAPER ONLY - geen Kraken-orders",
-        f"Paper BTC per trade: {BTC_SCALP_PAPER_AMOUNT_BTC:.8f}",
+        f"Mode: {btc_scalp_mode_label()}",
+        f"BTC per scalp: {BTC_SCALP_AMOUNT_BTC:.8f}",
         f"Early lock: +{BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS:.0f} -> floor +{BTC_SCALP_EARLY_LOCK_FLOOR_POINTS:.0f}",
         f"Trail trigger: +{BTC_SCALP_TRAIL_TRIGGER_POINTS:.0f} punten",
         f"Trail stap: {BTC_SCALP_TRAIL_STEP_POINTS:.0f} punten",
@@ -807,7 +929,7 @@ def format_btc_scalp_daily_summary(date_str=None):
         f"Verliestrades: {s['losses']}",
         f"Winrate: {s['winrate']:.1f}%",
         f"Punten bruto: {pts(s['points'])}",
-        f"Paper resultaat: {fmt_eur(s['eur'])}",
+        f"Resultaat: {fmt_eur(s['eur'])}",
     ]
     if s["best"]:
         lines.append(f"Beste scalp: {pts(s['best'].get('points'))} punten")
@@ -829,10 +951,10 @@ def format_btc_scalp_total_summary():
     s = btc_scalp_summarize(events)
     st = btc_scalp_load_state()
     lines = [
-        "BTC SCALP PAPER TOTAALOVERZICHT",
+        "BTC SCALP TOTAALOVERZICHT",
         "",
-        "Mode: PAPER ONLY - geen Kraken-orders",
-        f"Paper BTC per trade: {BTC_SCALP_PAPER_AMOUNT_BTC:.8f}",
+        f"Mode: {btc_scalp_mode_label()}",
+        f"BTC per scalp: {BTC_SCALP_AMOUNT_BTC:.8f}",
         f"Early lock: +{BTC_SCALP_EARLY_LOCK_TRIGGER_POINTS:.0f} -> floor +{BTC_SCALP_EARLY_LOCK_FLOOR_POINTS:.0f}",
         f"Trail trigger: +{BTC_SCALP_TRAIL_TRIGGER_POINTS:.0f} punten",
         f"Trail stap: {BTC_SCALP_TRAIL_STEP_POINTS:.0f} punten",
@@ -843,7 +965,7 @@ def format_btc_scalp_total_summary():
         f"Flats: {s['flats']}",
         f"Winrate: {s['winrate']:.1f}%",
         f"Punten totaal: {pts(s['points'])}",
-        f"Paper resultaat totaal: {fmt_eur(s['eur'])}",
+        f"Resultaat totaal: {fmt_eur(s['eur'])}",
     ]
     if s["best"]:
         lines.append(f"Beste scalp totaal: {pts(s['best'].get('points'))} punten")
@@ -2120,7 +2242,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
         f"Geschat netto: {fmt_eur(day_sum['net_eur_est'])}",
         f"Gesloten trades: {day_sum['closed_trades']}",
         "",
-        f"Serverpositie: {fval(state.get('bot_position_btc'), 0.0):.8f} BTC",
+        f"Scalp positie: {st.get('position')}",
         f"Tijd: {local_time_str()}",
     ]
 
@@ -2130,8 +2252,8 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 @app.route("/")
 def home():
     return jsonify({
-        "status": "BTC Trendbot 1 LIVE + BTC Scalp Paper + Turbobot Paper Engine draait",
-        "version": "app.py V9.34 COMBINED BTC TRENDBOT 1 + BTC SCALPBOT 1 PAPER TRAIL250",
+        "status": "BTC Trendbot 1 LIVE + BTC Scalpbot 1 LIVE + Turbobot Paper Engine draait",
+        "version": "app.py V9.37 COMBINED BTC TRENDBOT 1 LIVE + BTC SCALPBOT 1 LIVE DEFAULT TRUE",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -2147,7 +2269,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.34 COMBINED BTC TRENDBOT 1 + BTC SCALPBOT 1 PAPER TRAIL250",
+        "version": "app.py V9.37 COMBINED BTC TRENDBOT 1 LIVE + BTC SCALPBOT 1 LIVE DEFAULT TRUE",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -2184,7 +2306,11 @@ def status():
             "AUTO_DAILY_REPORTS_ENABLED": AUTO_DAILY_REPORTS_ENABLED,
             "BTC_DAILY_REPORT_TIME": f"{BTC_DAILY_REPORT_HOUR:02d}:{BTC_DAILY_REPORT_MINUTE:02d}",
             "TURBOBOT_DAILY_REPORT_TIME": f"{TURBOBOT_DAILY_REPORT_HOUR:02d}:{TURBOBOT_DAILY_REPORT_MINUTE:02d}",
-            "AUTO_SUMMARY_STATE_FILE": AUTO_SUMMARY_STATE_FILE
+            "AUTO_SUMMARY_STATE_FILE": AUTO_SUMMARY_STATE_FILE,
+            "BTC_SCALP_LIVE_ENABLED": BTC_SCALP_LIVE_ENABLED,
+            "BTC_SCALP_AMOUNT_BTC": BTC_SCALP_AMOUNT_BTC,
+            "BTC_SCALP_STATE_FILE": BTC_SCALP_STATE_FILE,
+            "BTC_SCALP_LOG_FILE": BTC_SCALP_LOG_FILE
         },
         "loss_guard_status": loss_guard_status_text(),
         "state": load_state(),
@@ -2195,10 +2321,12 @@ def status():
 @app.route("/btc_scalp_status")
 def btc_scalp_status_route():
     return jsonify({
-        "enabled": BTC_SCALP_PAPER_ENABLED,
+        "enabled": True,
+        "live_enabled": BTC_SCALP_LIVE_ENABLED,
+        "mode": btc_scalp_mode_label(),
         "state_file": BTC_SCALP_STATE_FILE,
         "log_file": BTC_SCALP_LOG_FILE,
-        "amount_btc": BTC_SCALP_PAPER_AMOUNT_BTC,
+        "amount_btc": BTC_SCALP_AMOUNT_BTC,
         "tp_points": BTC_SCALP_TP_POINTS,
         "trail_enabled": BTC_SCALP_TRAIL_ENABLED,
         "trail_trigger_points": BTC_SCALP_TRAIL_TRIGGER_POINTS,
@@ -2480,7 +2608,8 @@ def send_btc_trend_test():
 
 @app.route("/send_btc_scalp_test")
 def send_btc_scalp_test():
-    ok = send_telegram("TEST BTC SCALPBOT 1 PAPER - Telegram route SCALP", route="scalp")
+    mode = "LIVE" if BTC_SCALP_LIVE_ENABLED else "PAPER"
+    ok = send_telegram(f"TEST BTC SCALPBOT 1 {mode} - Telegram route SCALP", route="scalp")
     return jsonify({"ok": ok, "route": "scalp"})
 
 
@@ -2493,9 +2622,9 @@ def webhook():
         result = handle_turbobot_alert(data)
         return jsonify(result), 200
 
-    # BTC Scalpbot 1 is paper/Telegram-only and must never enter Kraken live route.
+    # BTC Scalpbot 1 heeft een eigen aparte live/paper route en raakt Trendbot-state niet aan.
     if clean(data.get("action")) in ["BTC_SCALP_BUY", "BTC_SCALP_EXIT"]:
-        result = handle_btc_scalp_paper(data)
+        result = handle_btc_scalp(data)
         return jsonify(result or {"event": "btc_scalp_no_action"}), 200
 
     action = clean(data.get("action"))
@@ -2508,9 +2637,8 @@ def webhook():
         send_telegram(blocked_message(data, "Bot/ticker/action wordt niet herkend als ondersteunde Kraken BTC bot."))
         return "ok", 200
 
-    # BTC Dual 1 Scalp paper wordt apart gemeten en voert nooit Kraken-orders uit.
-    # De live Trend/Kraken route hieronder blijft ongewijzigd.
-    handle_btc_scalp_paper(data)
+    # BTC Scalp-signalen worden apart afgehandeld. Trend/Kraken route hieronder blijft ongewijzigd.
+    handle_btc_scalp(data)
 
     if not json_live_requested(data):
         send_telegram(blocked_message(data, "TradingView JSON vraagt geen live Kraken-order aan."))

@@ -19,7 +19,7 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# V9.39: 22:02 dagoverzicht gesplitst naar BTC Trendbot en BTC Scalpbot + V9.38 recovery.
+# V9.40: silent flat-exit melding + Turbobot Telegram standaard uit. V9.39 split daily + recovery blijft actief.
 # Backwards compatible:
 # - CHAT_ID blijft de standaard / Trend live chat.
 # - Zet BTC_SCALP_CHAT_ID of SCALP_CHAT_ID voor aparte Scalp Telegram-chat.
@@ -110,6 +110,10 @@ TURBOBOT_COOLDOWN_AFTER_LOSS_SEC = int(os.environ.get("TURBOBOT_COOLDOWN_AFTER_L
 TURBOBOT_SILENCE_AFTER_DAILY_STOP = env_bval(os.environ.get("TURBOBOT_SILENCE_AFTER_DAILY_STOP", "true"))
 TURBOBOT_SILENCE_IGNORED_FLAT_EXITS = env_bval(os.environ.get("TURBOBOT_SILENCE_IGNORED_FLAT_EXITS", "true"))
 TURBOBOT_SILENCE_BAD_LOCKS = env_bval(os.environ.get("TURBOBOT_SILENCE_BAD_LOCKS", "true"))
+# V9.40: Turbobot blijft in Render bestaan, maar stuurt standaard geen Telegram meer.
+TURBOBOT_SEND_TELEGRAM = env_bval(os.environ.get("TURBOBOT_SEND_TELEGRAM", "false"))
+# V9.40: normale dubbele/flat BTC_EXIT niet meer naar Telegram sturen. Safety blijft actief.
+BTC_SILENCE_FLAT_EXIT_WARNINGS = env_bval(os.environ.get("BTC_SILENCE_FLAT_EXIT_WARNINGS", "true"))
 TURBOBOT_LOCK_REQUIRES_PROFIT = env_bval(os.environ.get("TURBOBOT_LOCK_REQUIRES_PROFIT", "true"))
 TURBOBOT_LOCK_MIN_OPEN_PCT = float(os.environ.get("TURBOBOT_LOCK_MIN_OPEN_PCT", "0.0"))
 
@@ -1918,8 +1922,10 @@ def handle_turbobot_alert(data):
     tb_roll_day_if_needed(state)
     tb_save_state(state)
     msg = tb_format_message(response_kind, response_signal, state, price, data, extra)
-    send_telegram(msg)
-    return {"ok": True, "signal": signal, "state": state, "message": msg}
+    if TURBOBOT_SEND_TELEGRAM:
+        send_telegram(msg)
+        return {"ok": True, "signal": signal, "state": state, "message": msg}
+    return {"ok": True, "signal": signal, "silent": True, "reason": "turbobot_telegram_off", "state": state}
 
 def tb_events_in_period(start_ts=None, end_ts=None):
     out = []
@@ -2395,7 +2401,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "BTC Trendbot 1 LIVE + BTC Scalpbot 1 LIVE + Turbobot Paper Engine draait",
-        "version": "app.py V9.39 COMBINED BTC LIVE + SCALP LIVE + SPLIT DAILY + BOT-OWNED RECOVERY",
+        "version": "app.py V9.40 COMBINED BTC LIVE + SCALP LIVE + SILENT FLAT EXIT + TURBOBOT SILENT",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -2411,7 +2417,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.39 COMBINED BTC LIVE + SCALP LIVE + SPLIT DAILY + BOT-OWNED RECOVERY",
+        "version": "app.py V9.40 COMBINED BTC LIVE + SCALP LIVE + SILENT FLAT EXIT + TURBOBOT SILENT",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -2601,12 +2607,18 @@ def send_auto_daily_summary(kind, date_str=None, force=False):
 
         if kind == "turbobot":
             msg = format_turbobot_daily_summary(date_str)
+            if not TURBOBOT_SEND_TELEGRAM:
+                mark_auto_summary_sent(kind, date_str)
+                return True, "Turbobot Telegram staat uit; dagoverzicht stil gemarkeerd."
         elif kind == "both":
             ok1, msg1 = send_auto_daily_summary("btc", date_str=date_str, force=force)
-            ok2 = send_telegram(format_turbobot_daily_summary(date_str))
-            if ok2:
-                mark_auto_summary_sent("turbobot", date_str)
-            return bool(ok1 and ok2), "BTC Trend/Scalp en Turbobot dagoverzicht verstuurd"
+            if TURBOBOT_SEND_TELEGRAM:
+                ok2 = send_telegram(format_turbobot_daily_summary(date_str))
+                if ok2:
+                    mark_auto_summary_sent("turbobot", date_str)
+                return bool(ok1 and ok2), "BTC Trend/Scalp en Turbobot dagoverzicht verstuurd"
+            mark_auto_summary_sent("turbobot", date_str)
+            return bool(ok1), "BTC Trend/Scalp dagoverzicht verstuurd; Turbobot Telegram staat uit"
         else:
             return False, f"Onbekend dagoverzicht type: {kind}"
 
@@ -2630,7 +2642,7 @@ def auto_daily_report_loop():
                 date_str = now.strftime("%Y-%m-%d")
                 if in_report_window(now, BTC_DAILY_REPORT_HOUR, BTC_DAILY_REPORT_MINUTE):
                     send_auto_daily_summary("btc", date_str=date_str, force=False)
-                if in_report_window(now, TURBOBOT_DAILY_REPORT_HOUR, TURBOBOT_DAILY_REPORT_MINUTE):
+                if TURBOBOT_SEND_TELEGRAM and in_report_window(now, TURBOBOT_DAILY_REPORT_HOUR, TURBOBOT_DAILY_REPORT_MINUTE):
                     send_auto_daily_summary("turbobot", date_str=date_str, force=False)
         except Exception as exc:
             try:
@@ -2663,6 +2675,8 @@ def auto_summary_status_route():
         "timezone": APP_TZ,
         "btc_daily_report_time": f"{BTC_DAILY_REPORT_HOUR:02d}:{BTC_DAILY_REPORT_MINUTE:02d}",
         "turbobot_daily_report_time": f"{TURBOBOT_DAILY_REPORT_HOUR:02d}:{TURBOBOT_DAILY_REPORT_MINUTE:02d}",
+        "turbobot_send_telegram": TURBOBOT_SEND_TELEGRAM,
+        "btc_silence_flat_exit_warnings": BTC_SILENCE_FLAT_EXIT_WARNINGS,
         "state_file": AUTO_SUMMARY_STATE_FILE,
         "state": load_auto_summary_state(),
     })
@@ -2674,8 +2688,11 @@ def send_all_daily_summaries_route():
     force = bval(request.args.get("force", "false"))
     if force:
         ok1, msg1 = send_auto_daily_summary("btc", date_str=date_str, force=True)
-        ok2, msg2 = send_auto_daily_summary("turbobot", date_str=date_str, force=True)
-        return jsonify({"ok": bool(ok1 and ok2), "btc": ok1, "turbobot": ok2, "date": date_str})
+        if TURBOBOT_SEND_TELEGRAM:
+            ok2, msg2 = send_auto_daily_summary("turbobot", date_str=date_str, force=True)
+        else:
+            ok2, msg2 = True, "Turbobot Telegram staat uit"
+        return jsonify({"ok": bool(ok1 and ok2), "btc": ok1, "turbobot": ok2, "turbobot_message": msg2, "date": date_str})
     ok, msg = send_auto_daily_summary("both", date_str=date_str, force=False)
     return jsonify({"ok": ok, "message": msg, "date": date_str})
 
@@ -2744,6 +2761,9 @@ def turbobot_daily_summary_route():
 def send_turbobot_daily_summary_route():
     date_str = request.args.get("date") or local_date_str()
     msg = format_turbobot_daily_summary(date_str)
+    if not TURBOBOT_SEND_TELEGRAM:
+        mark_auto_summary_sent("turbobot", date_str)
+        return jsonify({"ok": True, "silent": True, "message": "Turbobot Telegram staat uit", "preview": msg})
     ok = send_telegram(msg)
     if ok:
         mark_auto_summary_sent("turbobot", date_str)
@@ -2891,7 +2911,18 @@ Kraken result:
                 bot_pos = fval(state.get("bot_position_btc"), 0.0)
                 recovery_note = "\n\nV9.39 bot-owned recovery actief\n" + recovery_reason
             else:
-                send_telegram(blocked_message(data, "SELL geblokkeerd: server heeft geen bot-owned BTC positie geregistreerd. Recovery niet mogelijk: " + recovery_reason + ". Dit voorkomt verkoop van prive/eigen BTC."))
+                append_trade_event({
+                    "type": "FLAT_EXIT_IGNORED",
+                    "bot": bot,
+                    "ticker": ticker,
+                    "action": action,
+                    "price": fval(price, None),
+                    "reason": reason,
+                    "recovery_reason": recovery_reason,
+                    "raw": data
+                })
+                if not BTC_SILENCE_FLAT_EXIT_WARNINGS:
+                    send_telegram(blocked_message(data, "SELL geblokkeerd: server heeft geen bot-owned BTC positie geregistreerd. Recovery niet mogelijk: " + recovery_reason + ". Dit voorkomt verkoop van prive/eigen BTC."))
                 return "ok", 200
 
         btc_balance = get_btc_balance()

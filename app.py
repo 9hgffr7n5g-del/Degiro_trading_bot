@@ -19,7 +19,7 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# V9.37: gescheiden Telegram routes voor BTC Trendbot live en BTC Scalpbot live.
+# V9.39: 22:02 dagoverzicht gesplitst naar BTC Trendbot en BTC Scalpbot + V9.38 recovery.
 # Backwards compatible:
 # - CHAT_ID blijft de standaard / Trend live chat.
 # - Zet BTC_SCALP_CHAT_ID of SCALP_CHAT_ID voor aparte Scalp Telegram-chat.
@@ -67,6 +67,11 @@ TRADE_LOG_FILE = os.environ.get("TRADE_LOG_FILE", "/data/trades.json" if os.path
 APP_TZ = os.environ.get("APP_TZ", "Europe/Amsterdam")
 ROUND_TRIP_COST_POINTS = float(os.environ.get("ROUND_TRIP_COST_POINTS", "0.0"))
 
+# V9.38 recovery: herstel bot-owned positie uit eigen order-log na Render restart/deploy.
+# Veilig: alleen herstellen uit eerder door deze app geregistreerde BUY zonder latere SELL.
+BOT_OWNED_RECOVERY_ENABLED = env_bval(os.environ.get("BOT_OWNED_RECOVERY_ENABLED", "true"))
+BOT_OWNED_RECOVERY_LOOKBACK_SEC = int(os.environ.get("BOT_OWNED_RECOVERY_LOOKBACK_SEC", "86400"))
+
 # BTC Scalpbot 1 live engine - aparte Kraken-leg naast Trendbot.
 # Default LIVE volgens afspraak: 0.00400 BTC. Zet BTC_SCALP_LIVE_ENABLED=false voor paper-only.
 BTC_SCALP_LIVE_ENABLED = env_bval(os.environ.get("BTC_SCALP_LIVE_ENABLED", "true"))
@@ -110,7 +115,7 @@ TURBOBOT_LOCK_MIN_OPEN_PCT = float(os.environ.get("TURBOBOT_LOCK_MIN_OPEN_PCT", 
 
 
 # AUTO DAILY TELEGRAM REPORTS - Render-side, Pine blijft leeg.
-# BTC/Kraken live dagoverzicht om 22:02 Europe/Amsterdam.
+# BTC dagoverzicht om 22:02 Europe/Amsterdam: Trendbot naar Trend Telegram, Scalpbot naar Scalp Telegram.
 # Turbobot/LEV paper dagoverzicht om 22:15 Europe/Amsterdam.
 AUTO_DAILY_REPORTS_ENABLED = env_bval(os.environ.get("AUTO_DAILY_REPORTS_ENABLED", "true"))
 BTC_DAILY_REPORT_HOUR = int(os.environ.get("BTC_DAILY_REPORT_HOUR", "22"))
@@ -524,6 +529,66 @@ def append_trade_event(event):
 
 
 
+
+
+def trend_recover_state_from_log(current_price=None, data=None):
+    """Herstel Trendbot bot-owned state uit eigen trade-log.
+    Alleen veilig als de app eerder zelf een BUY heeft gelogd en er daarna geen SELL gelogd is.
+    Dit voorkomt verkoop van prive-BTC, maar lost state-verlies door Render restart/deploy op.
+    """
+    if not BOT_OWNED_RECOVERY_ENABLED:
+        return None, "recovery uitgeschakeld"
+    try:
+        events = load_trades()
+        if not events:
+            return None, "geen trade-log beschikbaar"
+        latest_sell_ts = 0
+        for e in events:
+            if e.get("type") == "ORDER" and clean(e.get("action")).upper() == "SELL":
+                latest_sell_ts = max(latest_sell_ts, int(e.get("ts") or 0))
+        candidate = None
+        for e in reversed(events):
+            if e.get("type") != "ORDER":
+                continue
+            if clean(e.get("action")).upper() != "BUY":
+                continue
+            ts = int(e.get("ts") or 0)
+            if ts <= latest_sell_ts:
+                continue
+            if now_ts() - ts > BOT_OWNED_RECOVERY_LOOKBACK_SEC:
+                continue
+            vol = fval(e.get("volume"), 0.0)
+            oid = clean(e.get("order_id"))
+            entry = fval(e.get("price"), None)
+            if vol >= MIN_BTC_VOLUME and oid:
+                candidate = e
+                break
+        if not candidate:
+            return None, "geen open eigen BUY gevonden in trade-log"
+        vol = min(fval(candidate.get("volume"), 0.0), MAX_BOT_POSITION_BTC)
+        btc_balance = get_btc_balance()
+        if btc_balance + 1e-9 < min(vol, MIN_BTC_VOLUME):
+            return None, f"Kraken BTC saldo te laag voor recovery: {btc_balance:.8f}"
+        entry = fval(candidate.get("price"), None)
+        oid = clean(candidate.get("order_id"))
+        st = load_state()
+        st["bot_position_btc"] = round(vol, 8)
+        st["last_buy_price"] = entry
+        st["avg_entry_price"] = entry
+        st["last_buy_volume"] = vol
+        st["last_buy_order_id"] = oid
+        st["last_buy_ts"] = int(candidate.get("ts") or now_ts())
+        st["last_action"] = "BUY_RECOVERED"
+        st["open_trade_id"] = candidate.get("open_trade_id") or oid or f"recovered-{now_ts()}"
+        st["recovered_from_log"] = True
+        st["recovered_ts"] = now_ts()
+        st["recovery_source"] = "trend_trade_log"
+        save_state(st)
+        return st, f"Trend state hersteld uit eigen BUY-log {oid} ({vol:.8f} BTC @ {fmt(entry, 1)})"
+    except Exception as e:
+        return None, f"recovery fout: {e}"
+
+
 def btc_scalp_load_state():
     with BTC_SCALP_LOCK:
         try:
@@ -599,6 +664,68 @@ def btc_scalp_append_event(event):
     events.append(event)
     btc_scalp_save_log(events)
     return event
+
+
+
+
+def btc_scalp_recover_state_from_log(current_price=None, data=None):
+    """Herstel Scalpbot live state uit eigen scalp-log na Render restart/deploy."""
+    if not BOT_OWNED_RECOVERY_ENABLED:
+        return None, "recovery uitgeschakeld"
+    try:
+        events = btc_scalp_load_log()
+        if not events:
+            return None, "geen scalp-log beschikbaar"
+        latest_close_ts = 0
+        for e in events:
+            if e.get("type") == "BTC_SCALP_CLOSED_TRADE":
+                latest_close_ts = max(latest_close_ts, int(e.get("ts") or 0))
+        candidate = None
+        for e in reversed(events):
+            if e.get("type") != "BTC_SCALP_OPEN":
+                continue
+            ts = int(e.get("ts") or 0)
+            if ts <= latest_close_ts:
+                continue
+            if now_ts() - ts > BOT_OWNED_RECOVERY_LOOKBACK_SEC:
+                continue
+            vol = fval(e.get("amount_btc"), 0.0)
+            oid = clean(e.get("order_id"))
+            entry = fval(e.get("entry_price"), None)
+            mode = clean(e.get("mode")).upper()
+            if vol >= MIN_BTC_VOLUME and oid and "LIVE" in mode:
+                candidate = e
+                break
+        if not candidate:
+            return None, "geen open eigen LIVE scalp BUY gevonden in scalp-log"
+        vol = min(fval(candidate.get("amount_btc"), BTC_SCALP_AMOUNT_BTC), BTC_SCALP_AMOUNT_BTC)
+        btc_balance = get_btc_balance()
+        if btc_balance + 1e-9 < min(vol, MIN_BTC_VOLUME):
+            return None, f"Kraken BTC saldo te laag voor scalp recovery: {btc_balance:.8f}"
+        entry = fval(candidate.get("entry_price"), None)
+        oid = clean(candidate.get("order_id"))
+        st = btc_scalp_load_state()
+        st["position"] = "LONG"
+        st["entry_price"] = entry
+        st["entry_ts"] = int(candidate.get("ts") or now_ts())
+        st["entry_reason"] = clean(candidate.get("reason")) or "recovered scalp"
+        st["entry_signal"] = clean(candidate.get("action")) or "BTC_SCALP_BUY"
+        st["entry_mode"] = btc_scalp_mode_label()
+        st["amount_btc"] = vol
+        st["last_buy_order_id"] = oid
+        st["last_buy_ts"] = int(candidate.get("ts") or now_ts())
+        st["last_action"] = "BUY_RECOVERED"
+        st["max_profit_points"] = 0.0
+        st["trail_active"] = False
+        st["trail_floor_points"] = None
+        st["early_lock_active"] = False
+        st["recovered_from_log"] = True
+        st["recovered_ts"] = now_ts()
+        st["recovery_source"] = "scalp_trade_log"
+        btc_scalp_save_state(st)
+        return st, f"Scalp state hersteld uit eigen BUY-log {oid} ({vol:.8f} BTC @ {fmt(entry, 1)})"
+    except Exception as e:
+        return None, f"scalp recovery fout: {e}"
 
 
 def btc_scalp_closed_events(start_ts=None, end_ts=None):
@@ -715,8 +842,16 @@ def btc_scalp_close(st, price, reason, action_label="SELL"):
     oid = None
 
     if BTC_SCALP_LIVE_ENABLED:
+        recovery_note = ""
         if not st.get("last_buy_order_id"):
-            return st, btc_scalp_order_failed_message("SELL", exitp, volume, reason, block_reason="Scalp-state heeft geen live buy order id. Oude paper-positie wordt niet live verkocht.")
+            recovered_st, recovery_reason = btc_scalp_recover_state_from_log(current_price=exitp)
+            if recovered_st is not None:
+                st = recovered_st
+                entry = fval(st.get("entry_price"), entry)
+                volume = fval(st.get("amount_btc"), volume)
+                recovery_note = "\nV9.39 scalp recovery actief: " + recovery_reason
+            else:
+                return st, btc_scalp_order_failed_message("SELL", exitp, volume, reason, block_reason="Scalp-state heeft geen live buy order id. Recovery niet mogelijk: " + recovery_reason + ". Oude paper-positie wordt niet live verkocht.")
         block_reason = btc_scalp_live_block_reason()
         if block_reason:
             return st, btc_scalp_order_failed_message("SELL", exitp, volume, reason, block_reason=block_reason)
@@ -782,7 +917,10 @@ def btc_scalp_close(st, price, reason, action_label="SELL"):
         "early_lock_floor_points": early_floor_before,
         "trail_floor_points": trail_floor_before
     })
-    return st, btc_scalp_exit_message(exitp, reason, st, entry, points, eur, result, volume=volume, oid=oid)
+    msg = btc_scalp_exit_message(exitp, reason, st, entry, points, eur, result, volume=volume, oid=oid)
+    if BTC_SCALP_LIVE_ENABLED and 'recovery_note' in locals() and recovery_note:
+        msg += recovery_note
+    return st, msg
 
 
 def handle_btc_scalp(data):
@@ -897,8 +1035,12 @@ def handle_btc_scalp(data):
 
     if action in ["BTC_EXIT", "BTC_SCALP_EXIT"]:
         if st.get("position") != "LONG":
-            btc_scalp_save_state(st)
-            return {"event": "scalp_exit_ignored_flat", "mode": btc_scalp_mode_label(), "position": "FLAT"}
+            recovered_st, recovery_reason = btc_scalp_recover_state_from_log(current_price=price, data=data)
+            if recovered_st is not None:
+                st = recovered_st
+            else:
+                btc_scalp_save_state(st)
+                return {"event": "scalp_exit_ignored_flat", "mode": btc_scalp_mode_label(), "position": "FLAT", "recovery": recovery_reason}
         st, msg = btc_scalp_close(st, price, reason, "SELL")
         if msg and BTC_SCALP_SEND_TELEGRAM:
             send_telegram(msg, route="scalp")
@@ -2242,7 +2384,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
         f"Geschat netto: {fmt_eur(day_sum['net_eur_est'])}",
         f"Gesloten trades: {day_sum['closed_trades']}",
         "",
-        f"Scalp positie: {st.get('position')}",
+        f"Botpositie na sell: {fval(state.get('bot_position_btc'), 0.0):.8f} BTC",
         f"Tijd: {local_time_str()}",
     ]
 
@@ -2253,7 +2395,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "BTC Trendbot 1 LIVE + BTC Scalpbot 1 LIVE + Turbobot Paper Engine draait",
-        "version": "app.py V9.37 COMBINED BTC TRENDBOT 1 LIVE + BTC SCALPBOT 1 LIVE DEFAULT TRUE",
+        "version": "app.py V9.39 COMBINED BTC LIVE + SCALP LIVE + SPLIT DAILY + BOT-OWNED RECOVERY",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -2269,7 +2411,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.37 COMBINED BTC TRENDBOT 1 LIVE + BTC SCALPBOT 1 LIVE DEFAULT TRUE",
+        "version": "app.py V9.39 COMBINED BTC LIVE + SCALP LIVE + SPLIT DAILY + BOT-OWNED RECOVERY",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -2287,6 +2429,8 @@ def status():
             "TRADE_LOG_FILE": TRADE_LOG_FILE,
             "APP_TZ": APP_TZ,
             "ROUND_TRIP_COST_POINTS": ROUND_TRIP_COST_POINTS,
+            "BOT_OWNED_RECOVERY_ENABLED": BOT_OWNED_RECOVERY_ENABLED,
+            "BOT_OWNED_RECOVERY_LOOKBACK_SEC": BOT_OWNED_RECOVERY_LOOKBACK_SEC,
             "LOSS_GUARD_ENABLED": LOSS_GUARD_ENABLED,
             "LOSS_STREAK_LIMIT": LOSS_STREAK_LIMIT,
             "LOSS_GUARD_DAILY_LIMIT_EUR": LOSS_GUARD_DAILY_LIMIT_EUR,
@@ -2421,23 +2565,48 @@ def mark_auto_summary_sent(kind, date_str):
 def send_auto_daily_summary(kind, date_str=None, force=False):
     date_str = date_str or local_date_str()
     with AUTO_SUMMARY_LOCK:
+        # V9.39: BTC dagoverzicht is gesplitst.
+        # Trendbot rapport gaat naar Trend Telegram, Scalpbot rapport naar Scalp Telegram.
+        if kind == "btc":
+            trend_key = "btc_trend"
+            scalp_key = "btc_scalp"
+            trend_ok = True
+            scalp_ok = True
+            sent_parts = []
+
+            if force or not auto_summary_already_sent(trend_key, date_str):
+                trend_msg = format_daily_summary(date_str)
+                trend_ok = send_telegram(trend_msg, route="trend")
+                if trend_ok:
+                    mark_auto_summary_sent(trend_key, date_str)
+                sent_parts.append(f"trend={'ok' if trend_ok else 'fout'}")
+            else:
+                sent_parts.append("trend=al verstuurd")
+
+            if force or not auto_summary_already_sent(scalp_key, date_str):
+                scalp_msg = format_btc_scalp_daily_summary(date_str)
+                scalp_ok = send_telegram(scalp_msg, route="scalp")
+                if scalp_ok:
+                    mark_auto_summary_sent(scalp_key, date_str)
+                sent_parts.append(f"scalp={'ok' if scalp_ok else 'fout'}")
+            else:
+                sent_parts.append("scalp=al verstuurd")
+
+            if trend_ok and scalp_ok:
+                mark_auto_summary_sent("btc", date_str)
+            return bool(trend_ok and scalp_ok), "BTC dagoverzicht gesplitst: " + ", ".join(sent_parts)
+
         if not force and auto_summary_already_sent(kind, date_str):
             return False, f"{kind} dagoverzicht voor {date_str} was al verstuurd"
 
-        if kind == "btc":
-            msg = format_daily_summary(date_str)
-        elif kind == "turbobot":
+        if kind == "turbobot":
             msg = format_turbobot_daily_summary(date_str)
         elif kind == "both":
-            btc_msg = format_daily_summary(date_str)
-            turbo_msg = format_turbobot_daily_summary(date_str)
-            ok1 = send_telegram(btc_msg)
-            ok2 = send_telegram(turbo_msg)
-            if ok1:
-                mark_auto_summary_sent("btc", date_str)
+            ok1, msg1 = send_auto_daily_summary("btc", date_str=date_str, force=force)
+            ok2 = send_telegram(format_turbobot_daily_summary(date_str))
             if ok2:
                 mark_auto_summary_sent("turbobot", date_str)
-            return bool(ok1 and ok2), "BTC en Turbobot dagoverzicht verstuurd"
+            return bool(ok1 and ok2), "BTC Trend/Scalp en Turbobot dagoverzicht verstuurd"
         else:
             return False, f"Onbekend dagoverzicht type: {kind}"
 
@@ -2527,10 +2696,10 @@ def weekly_summary_route():
 def send_daily_summary_route():
     date_str = request.args.get("date") or local_date_str()
     msg = format_daily_summary(date_str)
-    ok = send_telegram(msg)
+    ok = send_telegram(msg, route="trend")
     if ok:
-        mark_auto_summary_sent("btc", date_str)
-    return jsonify({"ok": ok, "message": msg})
+        mark_auto_summary_sent("btc_trend", date_str)
+    return jsonify({"ok": ok, "route": "trend", "message": msg})
 
 
 @app.route("/send_weekly_summary", methods=["GET", "POST"])
@@ -2714,9 +2883,16 @@ Kraken result:
         return "ok", 200
 
     if action == "BTC_EXIT":
+        recovery_note = ""
         if bot_pos < MIN_BTC_VOLUME:
-            send_telegram(blocked_message(data, "SELL geblokkeerd: server heeft geen bot-owned BTC positie geregistreerd. Dit voorkomt verkoop van prive/eigen BTC."))
-            return "ok", 200
+            recovered_state, recovery_reason = trend_recover_state_from_log(current_price=price, data=data)
+            if recovered_state is not None:
+                state = recovered_state
+                bot_pos = fval(state.get("bot_position_btc"), 0.0)
+                recovery_note = "\n\nV9.39 bot-owned recovery actief\n" + recovery_reason
+            else:
+                send_telegram(blocked_message(data, "SELL geblokkeerd: server heeft geen bot-owned BTC positie geregistreerd. Recovery niet mogelijk: " + recovery_reason + ". Dit voorkomt verkoop van prive/eigen BTC."))
+                return "ok", 200
 
         btc_balance = get_btc_balance()
 
@@ -2802,6 +2978,8 @@ Kraken result:
                 entry_before=entry_before,
                 pine_entry=get_pine_entry(data)
             )
+            if recovery_note:
+                msg += recovery_note
             if guard_info and guard_info.get("armed"):
                 msg += (
                     "\n\nRender chopbescherming actief"

@@ -19,7 +19,7 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# V9.40: silent flat-exit melding + Turbobot Telegram standaard uit. V9.39 split daily + recovery blijft actief.
+# V9.41: silent duplicate BUY melding. V9.40 silent flat-exit + Turbobot Telegram stil blijft actief.
 # Backwards compatible:
 # - CHAT_ID blijft de standaard / Trend live chat.
 # - Zet BTC_SCALP_CHAT_ID of SCALP_CHAT_ID voor aparte Scalp Telegram-chat.
@@ -113,6 +113,7 @@ TURBOBOT_SILENCE_BAD_LOCKS = env_bval(os.environ.get("TURBOBOT_SILENCE_BAD_LOCKS
 # V9.40: Turbobot blijft in Render bestaan, maar stuurt standaard geen Telegram meer.
 TURBOBOT_SEND_TELEGRAM = env_bval(os.environ.get("TURBOBOT_SEND_TELEGRAM", "false"))
 # V9.40: normale dubbele/flat BTC_EXIT niet meer naar Telegram sturen. Safety blijft actief.
+# V9.41: normale extra BTC_BUY terwijl Trendbot al long is stil blokkeren. Safety blijft actief.
 BTC_SILENCE_FLAT_EXIT_WARNINGS = env_bval(os.environ.get("BTC_SILENCE_FLAT_EXIT_WARNINGS", "true"))
 TURBOBOT_LOCK_REQUIRES_PROFIT = env_bval(os.environ.get("TURBOBOT_LOCK_REQUIRES_PROFIT", "true"))
 TURBOBOT_LOCK_MIN_OPEN_PCT = float(os.environ.get("TURBOBOT_LOCK_MIN_OPEN_PCT", "0.0"))
@@ -2401,7 +2402,7 @@ def sell_message(bot, ticker, price, volume, oid, reason, state, entry_before, p
 def home():
     return jsonify({
         "status": "BTC Trendbot 1 LIVE + BTC Scalpbot 1 LIVE + Turbobot Paper Engine draait",
-        "version": "app.py V9.40 COMBINED BTC LIVE + SCALP LIVE + SILENT FLAT EXIT + TURBOBOT SILENT",
+        "version": "app.py V9.41 COMBINED BTC LIVE + SCALP LIVE + SILENT FLAT EXIT + SILENT DUPLICATE BUY + TURBOBOT SILENT",
         "pair": PAIR,
         "env_live_allowed": env_live_allowed(),
         "state_file": STATE_FILE,
@@ -2417,7 +2418,7 @@ def home():
 @app.route("/status")
 def status():
     return jsonify({
-        "version": "app.py V9.40 COMBINED BTC LIVE + SCALP LIVE + SILENT FLAT EXIT + TURBOBOT SILENT",
+        "version": "app.py V9.41 COMBINED BTC LIVE + SCALP LIVE + SILENT FLAT EXIT + SILENT DUPLICATE BUY + TURBOBOT SILENT",
         "env_live_allowed": env_live_allowed(),
         "env": {
             "TRADE_MODE": TRADE_MODE_ENV,
@@ -2850,13 +2851,24 @@ def webhook():
     if action == "BTC_BUY":
         allow_add = bval(data.get("allow_add_buy"))
         if bot_pos >= MIN_BTC_VOLUME and not allow_add:
-            send_telegram(blocked_message(data, f"BUY geblokkeerd: server heeft al botpositie {bot_pos:.8f} BTC en allow_add_buy=false."))
+            # V9.41: normale dubbele Trend BUY terwijl server al long is niet meer naar Telegram sturen.
+            # Safety blijft actief: er wordt GEEN extra Kraken-buy gedaan.
+            state["last_blocked_buy_reason"] = f"BUY stil geblokkeerd: server heeft al botpositie {bot_pos:.8f} BTC en allow_add_buy=false."
+            state["last_blocked_buy_ts"] = now_ts()
+            state["last_blocked_buy_price"] = price
+            state["last_blocked_buy_action"] = action
+            save_state(state)
             return "ok", 200
 
         # Max botpositie bewaken op Render, onafhankelijk van Pine.
         remaining_btc = round(MAX_BOT_POSITION_BTC - bot_pos, 8)
         if remaining_btc < MIN_BTC_VOLUME:
-            send_telegram(blocked_message(data, f"BUY geblokkeerd: max botpositie bereikt. Botpositie: {bot_pos:.8f} BTC, max: {MAX_BOT_POSITION_BTC:.8f} BTC."))
+            # V9.41: max/duplicate BUY door bestaande positie stil blokkeren.
+            state["last_blocked_buy_reason"] = f"BUY stil geblokkeerd: max botpositie bereikt. Botpositie: {bot_pos:.8f} BTC, max: {MAX_BOT_POSITION_BTC:.8f} BTC."
+            state["last_blocked_buy_ts"] = now_ts()
+            state["last_blocked_buy_price"] = price
+            state["last_blocked_buy_action"] = action
+            save_state(state)
             return "ok", 200
         if volume_float > remaining_btc:
             volume_float = remaining_btc

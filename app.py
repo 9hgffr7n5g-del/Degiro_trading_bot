@@ -53,7 +53,7 @@ def env_bval(value):
 # Render env mag dit overschrijven met DEFAULT_BTC_VOLUME of BUY_ORDER_SIZE.
 DEFAULT_BTC_VOLUME = os.environ.get("BUY_ORDER_SIZE") or os.environ.get("DEFAULT_BTC_VOLUME", "0.04000")
 MIN_BTC_VOLUME = float(os.environ.get("MIN_BTC_VOLUME", "0.00010"))
-MAX_BOT_POSITION_BTC = float(os.environ.get("MAX_BOT_POSITION_BTC", "0.04000"))
+MAX_BOT_POSITION_BTC = float(os.environ.get("MAX_BOT_POSITION_BTC", "0.10000"))
 # Veiligheid: standaard bepaalt Render de BUY-grootte, ook als Pine nog 0.00010 meestuurt.
 # Zet HONOR_TV_BUY_VOLUME=true als je later juist de TradingView JSON leidend wilt maken.
 HONOR_TV_BUY_VOLUME = env_bval(os.environ.get("HONOR_TV_BUY_VOLUME", "false"))
